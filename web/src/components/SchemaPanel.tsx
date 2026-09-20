@@ -9,11 +9,16 @@ import { Switch } from '@/components/ui/switch';
 export function SchemaPanel({
   source,
   schema,
+  hasHeader,
+  onToggleHeader,
   onClose,
   onToggleEdit,
 }: {
   source: Source;
   schema: Schema;
+  /** Spreadsheets only: whether row 1 is treated as the column names. */
+  hasHeader: boolean;
+  onToggleHeader: (value: boolean) => void;
   onClose: () => void;
   onToggleEdit: (enabled: boolean) => void;
 }) {
@@ -77,6 +82,16 @@ export function SchemaPanel({
               {source.editEnabled ? 'Edit mode on' : 'Read-only'}
             </span>
           </label>
+          {source.kind !== 'sqlite' ? (
+            <label className="mt-2 flex cursor-pointer items-center gap-2">
+              <Switch
+                checked={hasHeader}
+                onCheckedChange={onToggleHeader}
+                aria-label="Treat the first row as the column names"
+              />
+              <span className="text-[11px] text-muted-foreground">First row is the header</span>
+            </label>
+          ) : null}
           {!schema.editable ? (
             <p className="mt-1.5 text-[10px] leading-relaxed text-muted-foreground">
               {schema.type === 'view'

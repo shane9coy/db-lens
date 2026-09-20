@@ -83,6 +83,7 @@ export function DataGrid({
   sort,
   filter,
   offset,
+  queryKey,
   onSortChange,
   onFilterChange,
   onMutate,
@@ -96,6 +97,8 @@ export function DataGrid({
   sort: { column: string | null; dir: 'asc' | 'desc' };
   filter: string;
   offset: number;
+  /** Changes when the query changes — but not when a mutation just refetches. */
+  queryKey: string;
   onSortChange: (column: string | null, dir: 'asc' | 'desc') => void;
   onFilterChange: (q: string) => void;
   onMutate: (ops: Mutation[]) => Promise<void>;
@@ -160,12 +163,22 @@ export function DataGrid({
     overscan: 14,
   });
 
-  // A new page invalidates any open editor and clamps the cursor.
+  // A new question resets the viewport and the cursor. A plain refetch (after a
+  // mutation) must not — that would yank you away from the cell you just edited.
   useEffect(() => {
     setEditing(null);
+    if (scrollRef.current) scrollRef.current.scrollTop = 0;
     setAnchor({ row: 0, column: 0 });
     setFocus({ row: 0, column: 0 });
-  }, [page]);
+  }, [queryKey]);
+
+  // After a refetch, keep the cursor where it is unless the page shrank.
+  useEffect(() => {
+    const maxRow = Math.max(0, page.rows.length - 1);
+    const maxColumn = Math.max(0, visible.length - 1);
+    setAnchor((p) => ({ row: Math.min(p.row, maxRow), column: Math.min(p.column, maxColumn) }));
+    setFocus((p) => ({ row: Math.min(p.row, maxRow), column: Math.min(p.column, maxColumn) }));
+  }, [page.rows.length, visible.length]);
 
   useEffect(() => {
     if (!notice) return;
@@ -214,12 +227,13 @@ export function DataGrid({
 
   const commit = useCallback(
     async (position: CellPos, text: string) => {
-      const column = visible[position.column]?.columnDef.meta?.column;
+      const meta = visible[position.column]?.columnDef.meta;
+      const column = meta?.column;
       const rowKey = page.rowKeys?.[position.row];
       setEditing(null);
-      if (!column || !rowKey) return;
+      if (!meta || !column || !rowKey) return;
 
-      const raw = page.rows[position.row]?.[column.colIndex ?? position.column];
+      const raw = page.rows[position.row]?.[column.colIndex ?? meta.index];
       const next = parseInput(text, column);
 
       const unchanged =
@@ -258,9 +272,9 @@ export function DataGrid({
     for (let r = rect.top; r <= rect.bottom; r += 1) {
       const cells: string[] = [];
       for (let c = rect.left; c <= rect.right; c += 1) {
-        const column = visible[c]?.columnDef.meta?.column;
-        if (!column) continue;
-        const raw = page.rows[r]?.[column.colIndex ?? c];
+        const meta = visible[c]?.columnDef.meta;
+        if (!meta) continue;
+        const raw = page.rows[r]?.[meta.column.colIndex ?? meta.index];
         cells.push(raw === null || raw === undefined ? '' : String(raw));
       }
       lines.push(cells.join('\t'));
@@ -378,7 +392,7 @@ export function DataGrid({
           <input
             value={filter}
             onChange={(event) => onFilterChange(event.target.value)}
-            placeholder={source.canQuery ? 'Filter rows…' : 'Filter all columns…'}
+            placeholder="Filter all columns…"
             className="h-7 w-56 rounded-md border border-input bg-transparent pr-6 pl-7 font-mono text-[11px] outline-none placeholder:text-muted-foreground/60 focus-visible:border-ring"
           />
           {filter ? (
@@ -563,7 +577,10 @@ export function DataGrid({
 
                 {visible.map((column, columnIndex) => {
                   const meta = column.columnDef.meta!;
-                  const sourceIndex = meta.column.colIndex ?? columnIndex;
+                  // `columnIndex` indexes the *visible* columns; `meta.index`
+                  // indexes the row array. They diverge as soon as a column is
+                  // hidden, so the row array must be read by `meta.index`.
+                  const sourceIndex = meta.column.colIndex ?? meta.index;
                   const raw = row?.[sourceIndex];
                   const kind = valueKind(raw, meta.column.binary);
                   const isEditing =

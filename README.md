@@ -54,19 +54,27 @@ Flags: `--port`, `--host`, `--data <dir>`, `--no-open`, `--help`, `--version`.
 | Source | Seen as | Tables are | Notes |
 | --- | --- | --- | --- |
 | `.sqlite` `.sqlite3` `.db` `.db3` | tables and views | real tables | read-only connection for browsing |
-| `.xlsx` `.xlsm` `.xls` | sheets | each sheet | first row is the header |
-| `.csv` `.tsv` | one sheet | that sheet | header row is consumed |
+| `.xlsx` `.xlsm` `.xls` | sheets | each sheet | first row is the header — toggleable |
+| `.csv` `.tsv` | one sheet | that sheet | header row is consumed — toggleable |
 
 Adding a **folder** registers every openable file under it and reports anything
 that failed to open. Files it cannot parse are rolled back out of the list
 rather than left behind as broken entries.
 
+Spreadsheets have no types and no constraints of their own, so two things are
+left to you in the schema panel: whether row 1 is the header (turn it off and
+the columns become `column_1…n` and the header row becomes data), and the
+inferred column type, which is read from a sample and shown as `mixed` when a
+column holds more than one kind of value.
+
 ## Reading
 
 - **Virtualized grid** — only the visible rows are in the DOM, so a 50,000-row
   table scrolls like a small one. Columns are individually hideable.
-- **Server-side filter and sort** — the `q` box narrows the whole table, not
-  just the current page. Sorting is 3-state: ascending → descending → natural.
+- **Server-side filter and sort** — the filter box searches every column of the
+  whole table, not just the current page, and each column header cycles
+  ascending → descending → natural. Changing either returns you to the top of
+  the results.
 - **Schema panel** — column types, PK, NOT NULL, index list, foreign keys, the
   original DDL, and the row identity used for writes.
 - **Row detail** — every field for one row, with copy-as-row and copy-as-JSON.
@@ -80,9 +88,11 @@ rounding, and BLOBs come back as base64 (or are elided when larger than 64 KB).
 
 ## Writing
 
-**Editing is off by default.** Each source has its own toggle in the schema
-panel, and the server refuses write requests for sources where it is off — the
-UI is not the only gate.
+**Editing is off by default.** Every source carries its own toggle — the lock
+beside its name in the rail, or the switch in the schema panel — and the server
+refuses write requests for sources where it is off, so the UI is not the only
+gate. A table with no `rowid` and no primary key, and every view, stays
+read-only however the toggle is set.
 
 - **SQLite** — edit a cell, insert a row, delete a row. Every mutation runs in a
   transaction, and a row that changed underneath you produces a conflict rather

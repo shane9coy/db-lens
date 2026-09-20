@@ -47,6 +47,9 @@ export default function App() {
   const [objects, setObjects] = useState<SourceObject[]>([]);
   const [objectsLoading, setObjectsLoading] = useState(false);
   const [activeObject, setActiveObject] = useState<string | null>(null);
+  /** Object named by the URL. `null` means "pick something", not "select nothing". */
+  const [requestedObject, setRequestedObject] = useState<string | null>(null);
+  const [hasHeader, setHasHeader] = useState(true);
 
   const [schema, setSchema] = useState<Schema | null>(null);
   const [page, setPage] = useState<RowPage | null>(null);
@@ -93,7 +96,8 @@ export default function App() {
   // registering a path.
   useEffect(() => {
     void (async () => {
-      const { sourceId } = readHash();
+      const { sourceId, objectName } = readHash();
+      setRequestedObject(objectName);
       const list = await refreshSources();
       if (sourceId !== null && list.some((source) => source.id === sourceId)) {
         setActiveSourceId(sourceId);
@@ -103,6 +107,12 @@ export default function App() {
     })();
   }, [refreshSources]);
 
+  // Spreadsheet columns are untyped, so "row 1 is the header" has to be
+  // toggleable; it resets whenever a different object is shown.
+  useEffect(() => {
+    setHasHeader(true);
+  }, [activeObject]);
+
   // `writeHash` uses replaceState, so this only fires for navigations the app
   // did not make: the back button, or a link opened into a running tab.
   useEffect(() => {
@@ -110,7 +120,10 @@ export default function App() {
       const { sourceId, objectName } = readHash();
       if (sourceId === null) return;
       setActiveSourceId(sourceId);
-      setActiveObject(objectName);
+      // Hand the choice to the objects effect. Nulling `activeObject` here
+      // would strand the view when the hash names a source that is already
+      // active, because that effect would never re-run.
+      setRequestedObject(objectName);
       setSort({ column: null, dir: 'asc' });
       setFilter('');
       setAppliedFilter('');
@@ -135,10 +148,12 @@ export default function App() {
       .then(({ objects: list }) => {
         if (cancelled) return;
         setObjects(list);
-        const fromHash = readHash().objectName;
         setActiveObject((current) => {
+          // A URL-named object beats whatever was showing.
+          if (requestedObject && list.some((object) => object.name === requestedObject)) {
+            return requestedObject;
+          }
           if (current && list.some((object) => object.name === current)) return current;
-          if (fromHash && list.some((object) => object.name === fromHash)) return fromHash;
           return list[0]?.name ?? null;
         });
       })
@@ -152,7 +167,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [activeSourceId, objectsToken]);
+  }, [activeSourceId, objectsToken, requestedObject]);
 
   useEffect(() => {
     if (activeSourceId === null || !activeObject) {
@@ -161,7 +176,7 @@ export default function App() {
     }
     let cancelled = false;
     api
-      .schema(activeSourceId, activeObject)
+      .schema(activeSourceId, activeObject, hasHeader)
       .then((next) => {
         if (!cancelled) setSchema(next);
       })
@@ -171,7 +186,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [activeSourceId, activeObject, refreshToken]);
+  }, [activeSourceId, activeObject, refreshToken, hasHeader]);
 
   useEffect(() => {
     if (activeSourceId === null || !activeObject) {
@@ -189,6 +204,7 @@ export default function App() {
         sort: sort.column,
         dir: sort.dir,
         q: appliedFilter,
+        hasHeader,
       })
       .then((next) => {
         if (cancelled) return;
@@ -206,7 +222,16 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [activeSourceId, activeObject, sort.column, sort.dir, appliedFilter, offset, refreshToken]);
+  }, [
+    activeSourceId,
+    activeObject,
+    sort.column,
+    sort.dir,
+    appliedFilter,
+    offset,
+    refreshToken,
+    hasHeader,
+  ]);
 
   // Typing in the filter box should not fire a query per keystroke.
   useEffect(() => {
@@ -231,6 +256,7 @@ export default function App() {
   const selectObject = useCallback(
     (name: string) => {
       setActiveObject(name);
+      setRequestedObject(name);
       setSort({ column: null, dir: 'asc' });
       setFilter('');
       setAppliedFilter('');
@@ -241,22 +267,20 @@ export default function App() {
     [activeSourceId],
   );
 
-  const selectSource = useCallback(
-    (source: Source) => {
-      setActiveSourceId(source.id);
-      setActiveObject(null);
-      setPage(null);
-      setSchema(null);
-      setSort({ column: null, dir: 'asc' });
-      setFilter('');
-      setAppliedFilter('');
-      setOffset(0);
-      setDetailRow(null);
-      setExpanded((prev) => ({ ...prev, [source.id]: true }));
-      writeHash(source.id, null);
-    },
-    [],
-  );
+  const selectSource = useCallback((source: Source) => {
+    setActiveSourceId(source.id);
+    setRequestedObject(null);
+    setActiveObject(null);
+    setPage(null);
+    setSchema(null);
+    setSort({ column: null, dir: 'asc' });
+    setFilter('');
+    setAppliedFilter('');
+    setOffset(0);
+    setDetailRow(null);
+    setExpanded((prev) => ({ ...prev, [source.id]: true }));
+    writeHash(source.id, null);
+  }, []);
 
   const openPath = useCallback(
     async (target: string) => {
@@ -278,6 +302,7 @@ export default function App() {
                 : `opened ${result.added.length} files from ${first.path.replace(/\/[^/]+$/, '')}`,
           });
           setActiveSourceId(first.id);
+          setRequestedObject(null);
           setActiveObject(null);
           setExpanded((prev) => ({ ...prev, [first.id]: true }));
           setObjectsToken((token) => token + 1);
@@ -304,17 +329,23 @@ export default function App() {
     [activeSourceId, activeObject],
   );
 
-  const toggleEdit = useCallback(
-    async (enabled: boolean) => {
-      if (activeSourceId === null) return;
+  const toggleEditFor = useCallback(
+    async (source: Source, enabled: boolean) => {
       try {
-        await api.setEditEnabled(activeSourceId, enabled);
+        await api.setEditEnabled(source.id, enabled);
         await refreshSources();
       } catch (err) {
         setError(err instanceof Error ? err.message : 'Could not change edit mode');
       }
     },
-    [activeSourceId, refreshSources],
+    [refreshSources],
+  );
+
+  const toggleEdit = useCallback(
+    (enabled: boolean) => {
+      if (activeSource) void toggleEditFor(activeSource, enabled);
+    },
+    [activeSource, toggleEditFor],
   );
 
   const removeSource = useCallback(
@@ -339,6 +370,21 @@ export default function App() {
     if (!page || detailRow === null) return '';
     return String(page.rowNumbers?.[detailRow] ?? offset + detailRow + 1);
   }, [page, detailRow, offset]);
+
+  /**
+   * Identifies the current *question*, not the current answer. Mutations bump
+   * `refreshToken` and refetch, but the grid must keep its scroll position and
+   * cursor across those; a new filter, sort, page or table must reset both.
+   */
+  const queryKey = [
+    activeSourceId ?? '',
+    activeObject ?? '',
+    sort.column ?? '',
+    sort.dir,
+    appliedFilter,
+    offset,
+    hasHeader ? 1 : 0,
+  ].join('|');
 
   return (
     <div className="flex h-full flex-col">
@@ -419,6 +465,7 @@ export default function App() {
           onSelectObject={selectObject}
           onRemoveSource={(source) => void removeSource(source)}
           onRequestOpen={() => setFocusToken((token) => token + 1)}
+          onToggleEdit={(source, enabled) => void toggleEditFor(source, enabled)}
         />
 
         <main className="flex min-w-0 flex-1 flex-col">
@@ -448,6 +495,7 @@ export default function App() {
                 sort={sort}
                 filter={filter}
                 offset={offset}
+                queryKey={queryKey}
                 onSortChange={(column, dir) => setSort({ column, dir })}
                 onFilterChange={setFilter}
                 onMutate={mutate}
@@ -497,6 +545,8 @@ export default function App() {
           <SchemaPanel
             source={activeSource}
             schema={schema}
+            hasHeader={hasHeader}
+            onToggleHeader={setHasHeader}
             onClose={() => setSchemaOpen(false)}
             onToggleEdit={(enabled) => void toggleEdit(enabled)}
           />
@@ -510,7 +560,6 @@ export default function App() {
         shown={page?.rows.length ?? 0}
         offset={offset}
         latencyMs={latency}
-        selection={page?.rowKeys ? 'copyable' : null}
       />
 
       <QuickSwitch

@@ -34,6 +34,7 @@ export function SourceRail({
   onSelectObject,
   onRemoveSource,
   onRequestOpen,
+  onToggleEdit,
 }: {
   sources: Source[];
   objects: SourceObject[];
@@ -46,6 +47,7 @@ export function SourceRail({
   onSelectObject: (name: string) => void;
   onRemoveSource: (source: Source) => void;
   onRequestOpen: () => void;
+  onToggleEdit: (source: Source, enabled: boolean) => void;
 }) {
   return (
     <aside className="flex w-64 shrink-0 flex-col border-r border-border bg-card/40">
@@ -126,16 +128,31 @@ export function SourceRail({
                   </span>
                   {!source.exists ? (
                     <span className="shrink-0 font-mono text-[9px] text-destructive">gone</span>
-                  ) : source.canEdit ? (
-                    <span className="shrink-0" title={source.editEnabled ? 'Writes unlocked' : 'Read-only'}>
-                      {source.editEnabled ? (
-                        <Unlock className="size-3 text-warning" />
-                      ) : (
-                        <Lock className="size-3 text-muted-foreground/50" />
-                      )}
-                    </span>
                   ) : null}
                 </button>
+
+                {/* Sibling of the select button, not a child — nesting buttons
+                    is invalid, and this needs its own click target. */}
+                {source.exists && source.canEdit ? (
+                  <button
+                    type="button"
+                    onClick={() => onToggleEdit(source, !source.editEnabled)}
+                    aria-pressed={source.editEnabled}
+                    aria-label={`${source.editEnabled ? 'Lock' : 'Unlock'} ${source.name}`}
+                    title={
+                      source.editEnabled
+                        ? 'Edit mode on — click to make read-only'
+                        : 'Read-only — click to allow edits'
+                    }
+                    className="shrink-0 rounded p-0.5 hover:bg-accent"
+                  >
+                    {source.editEnabled ? (
+                      <Unlock className="size-3 text-warning" />
+                    ) : (
+                      <Lock className="size-3 text-muted-foreground/50" />
+                    )}
+                  </button>
+                ) : null}
 
                 <button
                   type="button"

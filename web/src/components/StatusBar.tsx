@@ -23,7 +23,6 @@ export function StatusBar({
   shown,
   offset,
   latencyMs,
-  selection,
 }: {
   source: Source | null;
   objectName: string | null;
@@ -31,7 +30,6 @@ export function StatusBar({
   shown: number;
   offset: number;
   latencyMs: number | null;
-  selection: string | null;
 }) {
   if (!source) {
     return (
@@ -67,8 +65,6 @@ export function StatusBar({
           </span>
         </span>
       ) : null}
-
-      {selection ? <span className="text-primary/80">{selection}</span> : null}
 
       <span className="ml-auto flex items-center gap-3">
         {latencyMs !== null ? (

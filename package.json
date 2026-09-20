@@ -1,0 +1,29 @@
+{
+  "name": "db-lens",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Local multi-source table viewer + editor for SQLite, Excel and CSV files.",
+  "type": "module",
+  "bin": {
+    "dblens": "./cli.mjs"
+  },
+  "scripts": {
+    "postinstall": "npm --prefix web install --no-audit --no-fund",
+    "start": "node cli.mjs",
+    "build": "npm --prefix web run build",
+    "dev": "npm --prefix web run dev",
+    "fixtures": "node fixtures/make.mjs",
+    "smoke": "node scripts/smoke.mjs",
+    "smoke:ui": "node scripts/ui-smoke.mjs"
+  },
+  "dependencies": {
+    "pg": "^8.23.0",
+    "xlsx": "https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz"
+  },
+  "engines": {
+    "node": ">=23.0.0"
+  },
+  "devDependencies": {
+    "playwright": "^1.63.0"
+  }
+}

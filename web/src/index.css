@@ -1,0 +1,149 @@
+@import 'tailwindcss';
+
+/*
+ * Pin the scan explicitly. Tailwind's automatic source detection walks the
+ * project root and honours .gitignore, which makes the generated CSS depend on
+ * repository state rather than on the code.
+ */
+@source "./**/*.{ts,tsx}";
+@source "../index.html";
+
+@custom-variant dark (&:is(.dark *));
+
+/*
+ * DB Lens runs dark-first: the tokens below are the dark theme, applied at
+ * :root so there is no light-mode flash. `.dark` is kept as an alias so the
+ * shadcn component idioms keep working unchanged.
+ */
+:root,
+.dark {
+  --radius: 0.55rem;
+
+  --background: oklch(0.145 0.007 285);
+  --foreground: oklch(0.945 0.004 285);
+
+  --card: oklch(0.181 0.008 285);
+  --card-foreground: oklch(0.945 0.004 285);
+
+  --popover: oklch(0.196 0.009 285);
+  --popover-foreground: oklch(0.945 0.004 285);
+
+  --primary: oklch(0.68 0.155 287);
+  --primary-foreground: oklch(0.99 0.002 285);
+
+  --secondary: oklch(0.255 0.009 285);
+  --secondary-foreground: oklch(0.945 0.004 285);
+
+  --muted: oklch(0.235 0.008 285);
+  --muted-foreground: oklch(0.665 0.012 285);
+
+  --accent: oklch(0.28 0.02 287);
+  --accent-foreground: oklch(0.96 0.004 285);
+
+  --destructive: oklch(0.62 0.19 25);
+  --destructive-foreground: oklch(0.99 0.002 285);
+
+  --success: oklch(0.68 0.15 155);
+  --warning: oklch(0.78 0.14 80);
+
+  --border: oklch(0.275 0.009 285);
+  --input: oklch(0.3 0.01 285);
+  --ring: oklch(0.62 0.13 287);
+
+  /* Type badges — one hue per inferred column type. */
+  --type-number: oklch(0.72 0.12 220);
+  --type-text: oklch(0.72 0.11 150);
+  --type-date: oklch(0.75 0.12 85);
+  --type-bool: oklch(0.72 0.13 320);
+  --type-blob: oklch(0.7 0.1 30);
+  --type-empty: oklch(0.6 0.01 285);
+}
+
+@theme inline {
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-success: var(--success);
+  --color-warning: var(--warning);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-type-number: var(--type-number);
+  --color-type-text: var(--type-text);
+  --color-type-date: var(--type-date);
+  --color-type-bool: var(--type-bool);
+  --color-type-blob: var(--type-blob);
+  --color-type-empty: var(--type-empty);
+
+  --radius-sm: calc(var(--radius) - 2px);
+  --radius-md: var(--radius);
+  --radius-lg: calc(var(--radius) + 2px);
+  --radius-xl: calc(var(--radius) + 6px);
+
+  --font-mono: ui-monospace, 'SF Mono', SFMono-Regular, Menlo, monospace;
+}
+
+@layer base {
+  * {
+    border-color: var(--border);
+  }
+
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    background-color: var(--background);
+    color: var(--foreground);
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+    font-size: 13px;
+    -webkit-font-smoothing: antialiased;
+    overscroll-behavior: none;
+  }
+
+  ::selection {
+    background-color: color-mix(in oklch, var(--primary) 40%, transparent);
+  }
+
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--border);
+    border-radius: 6px;
+    border: 2px solid var(--background);
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--input);
+  }
+  ::-webkit-scrollbar-corner {
+    background: transparent;
+  }
+}
+
+@layer utilities {
+  /* Numeric columns line up only with tabular figures. */
+  .tabular {
+    font-variant-numeric: tabular-nums;
+    font-feature-settings: 'tnum';
+  }
+}

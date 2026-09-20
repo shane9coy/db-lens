@@ -1,0 +1,14 @@
+node_modules/
+web/node_modules/
+web/dist/
+*.tsbuildinfo
+
+# DB Lens's own state (the list of sources you have opened)
+data/
+
+# Artifacts written next to your data when editing a spreadsheet
+*.dblens-backup
+*.dblens-tmp*
+
+.DS_Store
+*.log

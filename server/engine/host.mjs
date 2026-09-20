@@ -100,6 +100,19 @@ export class Engine {
     this.#pending.clear();
   }
 
+  /**
+   * Stop a worker without waiting on it.
+   *
+   * `terminate()` cannot interrupt a thread parked inside native SQLite, so its
+   * promise can take as long as the statement does. Detaching first (`unref`)
+   * means a thread that refuses to die still cannot hold the process open once
+   * everything else has finished.
+   */
+  #detach(worker) {
+    worker.unref?.();
+    worker.terminate().catch(() => {});
+  }
+
   /** Run `method` in the worker, rejecting if it exceeds the deadline. */
   call(method, params = {}, { timeoutMs } = {}) {
     if (this.#closed) {
@@ -120,7 +133,7 @@ export class Engine {
           { status: 504 },
         );
         this.#failAll(error);
-        worker.terminate().catch(() => {});
+        this.#detach(worker);
         this.#worker = null;
         reject(error);
       }, budget);
@@ -132,10 +145,31 @@ export class Engine {
   }
 
   async close() {
+    if (this.#closed) return;
     this.#closed = true;
+
     const worker = this.#worker;
     this.#worker = null;
     this.#failAll(new EngineError('Engine closed.', { status: 503 }));
-    if (worker) await worker.terminate().catch(() => {});
+    if (!worker) return;
+
+    // Give the adapter a chance to release what it holds (an open connection
+    // pool, a workbook cache). Never let that hold shutdown open: a thread
+    // stuck in native code cannot answer at all, and postgres pools that are
+    // never ended keep sockets alive.
+    await Promise.race([
+      new Promise((resolve) => {
+        const id = (this.#seq += 1);
+        worker.once('message', resolve);
+        worker.once('exit', resolve);
+        worker.postMessage({ id, method: 'close', params: {} });
+      }),
+      new Promise((resolve) => {
+        const timer = setTimeout(resolve, 500);
+        timer.unref?.();
+      }),
+    ]);
+
+    this.#detach(worker);
   }
 }

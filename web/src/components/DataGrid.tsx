@@ -35,9 +35,18 @@ declare module '@tanstack/react-table' {
 
 type Row = unknown[];
 type CellPos = { row: number; column: number };
+type BufferedEdit = { rowKey: string; column: Column; value: unknown };
 
 const ROW_HEIGHT = 29;
 const GUTTER = 46;
+
+/**
+ * A workbook save rewrites the whole file — tens of milliseconds on the sample,
+ * seconds on a large sheet — so consecutive cell edits there are collected and
+ * written together. Every other source updates a single row and saves
+ * immediately, which is both cheaper and what a user expects.
+ */
+const BUFFER_MS = 700;
 
 function columnWidth(column: Column): number {
   const type = (column.type || '').toLowerCase();
@@ -119,10 +128,21 @@ export function DataGrid({
   const [editing, setEditing] = useState<CellPos | null>(null);
   const [draft, setDraft] = useState('');
   const [insertOpen, setInsertOpen] = useState(false);
-  const [pending, setPending] = useState<Set<string>>(new Set());
+  const [inFlight, setInFlight] = useState<Set<string>>(new Set());
+  const [bufferedCount, setBufferedCount] = useState(0);
   const [notice, setNotice] = useState<string | null>(null);
 
   const editable = source.editEnabled && schema.editable;
+  const bufferedWrites = source.kind === 'excel' || source.kind === 'csv';
+  /** Edits typed but not yet written, keyed by `${row}:${column}`. */
+  const buffer = useRef(new Map<string, BufferedEdit>());
+  const flushTimer = useRef<number | null>(null);
+  const mutateRef = useRef(onMutate);
+  const flushRef = useRef<() => Promise<void>>(async () => {});
+
+  useEffect(() => {
+    mutateRef.current = onMutate;
+  }, [onMutate]);
 
   const columns = useMemo<ColumnDef<Row, unknown>[]>(
     () =>
@@ -173,6 +193,8 @@ export function DataGrid({
   // A new question resets the viewport and the cursor. A plain refetch (after a
   // mutation) must not — that would yank you away from the cell you just edited.
   useEffect(() => {
+    // Anything typed belongs to the view being left, so write it first.
+    void flushRef.current();
     setEditing(null);
     if (scrollRef.current) scrollRef.current.scrollTop = 0;
     setAnchor({ row: 0, column: 0 });
@@ -232,46 +254,112 @@ export function DataGrid({
     [page.rows.length, visible.length, scrollCellIntoView],
   );
 
+  /**
+   * Write everything typed since the last save, as one batch — one request and,
+   * for a workbook, one rewrite.
+   */
+  const flush = useCallback(async () => {
+    if (flushTimer.current !== null) {
+      window.clearTimeout(flushTimer.current);
+      flushTimer.current = null;
+    }
+    if (buffer.current.size === 0) return;
+
+    const entries = [...buffer.current.entries()];
+    buffer.current = new Map();
+    setBufferedCount(0);
+    setInFlight(new Set(entries.map(([key]) => key)));
+
+    try {
+      await mutateRef.current(
+        entries.map(([, edit]) => ({
+          op: 'update' as const,
+          rowKey: edit.rowKey,
+          column: edit.column.name,
+          columnIndex: edit.column.colIndex,
+          value: edit.value,
+        })),
+      );
+    } catch (err) {
+      setNotice(err instanceof Error ? err.message : 'Save failed');
+    } finally {
+      setInFlight(new Set());
+    }
+  }, []);
+
+  useEffect(() => {
+    flushRef.current = flush;
+  }, [flush]);
+
+  /** Save anything outstanding when the tab is hidden or the grid goes away. */
+  useEffect(() => {
+    const onVisibility = () => {
+      if (document.visibilityState === 'hidden') void flushRef.current();
+    };
+    document.addEventListener('visibilitychange', onVisibility);
+    return () => {
+      document.removeEventListener('visibilitychange', onVisibility);
+      void flushRef.current();
+    };
+  }, []);
+
   const commit = useCallback(
-    async (position: CellPos, text: string) => {
+    (position: CellPos, text: string) => {
       const meta = visible[position.column]?.columnDef.meta;
       const column = meta?.column;
       const rowKey = page.rowKeys?.[position.row];
       setEditing(null);
       if (!meta || !column || !rowKey) return;
 
-      const raw = page.rows[position.row]?.[column.colIndex ?? meta.index];
+      const key = `${position.row}:${position.column}`;
+      const queued = buffer.current.get(key);
+      const serverValue = page.rows[position.row]?.[column.colIndex ?? meta.index];
       const next = parseInput(text, column);
 
+      // Compare against what the user last typed, so re-committing an
+      // already-buffered cell is still a no-op.
+      const reference = queued ? queued.value : serverValue;
       const unchanged =
-        next === raw ||
-        (next !== null && raw !== null && String(next) === String(raw)) ||
-        (next === null && (raw === null || raw === undefined));
-      if (unchanged) return;
+        next === reference ||
+        (next !== null && reference !== null && String(next) === String(reference)) ||
+        (next === null && (reference === null || reference === undefined));
 
-      const key = `${position.row}:${position.column}`;
-      setPending((prev) => new Set(prev).add(key));
-      try {
-        await onMutate([
-          {
-            op: 'update',
-            rowKey,
-            column: column.name,
-            columnIndex: column.colIndex,
-            value: next,
-          },
-        ]);
-      } catch (err) {
-        setNotice(err instanceof Error ? err.message : 'Update failed');
-      } finally {
-        setPending((prev) => {
-          const copy = new Set(prev);
-          copy.delete(key);
-          return copy;
-        });
+      if (unchanged) {
+        if (queued) {
+          buffer.current.delete(key);
+          setBufferedCount(buffer.current.size);
+        }
+        return;
       }
+
+      if (!bufferedWrites) {
+        // A single row update is cheap, so it saves immediately and the
+        // interaction is unchanged.
+        setInFlight((prev) => new Set(prev).add(key));
+        mutateRef
+          .current([
+            { op: 'update', rowKey, column: column.name, columnIndex: column.colIndex, value: next },
+          ])
+          .catch((err: unknown) => setNotice(err instanceof Error ? err.message : 'Update failed'))
+          .finally(() => {
+            setInFlight((prev) => {
+              const copy = new Set(prev);
+              copy.delete(key);
+              return copy;
+            });
+          });
+        return;
+      }
+
+      buffer.current.set(key, { rowKey, column, value: next });
+      setBufferedCount(buffer.current.size);
+      if (flushTimer.current !== null) window.clearTimeout(flushTimer.current);
+      flushTimer.current = window.setTimeout(() => {
+        flushTimer.current = null;
+        void flush();
+      }, BUFFER_MS);
     },
-    [visible, page.rowKeys, page.rows, onMutate],
+    [visible, page.rowKeys, page.rows, bufferedWrites, flush],
   );
 
   const copySelection = useCallback(async () => {
@@ -360,22 +448,23 @@ export function DataGrid({
     async (index: number) => {
       const rowKey = page.rowKeys?.[index];
       if (!rowKey) return;
+      // A structural change shifts every row below it, so buffered edits must
+      // be written against the row numbers they were typed on.
+      await flushRef.current();
       try {
-        await onMutate([{ op: 'delete', rowKey }]);
+        await mutateRef.current([{ op: 'delete', rowKey }]);
       } catch (err) {
         setNotice(err instanceof Error ? err.message : 'Delete failed');
       }
     },
-    [page.rowKeys, onMutate],
+    [page.rowKeys],
   );
 
-  const insertRow = useCallback(
-    async (values: Record<string, unknown>) => {
-      await onMutate([{ op: 'insert', values }]);
-      setNotice('Row inserted');
-    },
-    [onMutate],
-  );
+  const insertRow = useCallback(async (values: Record<string, unknown>) => {
+    await flushRef.current();
+    await mutateRef.current([{ op: 'insert', values }]);
+    setNotice('Row inserted');
+  }, []);
 
   const sortBy = (column: Column) => {
     if (sort.column !== column.name) onSortChange(column.name, 'asc');
@@ -420,6 +509,16 @@ export function DataGrid({
 
         <div className="ml-auto flex items-center gap-1.5">
           {notice ? <span className="mr-1 text-[11px] text-warning">{notice}</span> : null}
+          {bufferedCount > 0 ? (
+            <button
+              type="button"
+              onClick={() => void flush()}
+              title="Save the edits you have typed"
+              className="mr-1 rounded border border-warning/40 bg-warning/10 px-1.5 py-0.5 font-mono text-[10px] text-warning hover:bg-warning/20"
+            >
+              {bufferedCount} unsaved — save
+            </button>
+          ) : null}
 
           <Popover
             align="end"
@@ -588,11 +687,15 @@ export function DataGrid({
                   // indexes the row array. They diverge as soon as a column is
                   // hidden, so the row array must be read by `meta.index`.
                   const sourceIndex = meta.column.colIndex ?? meta.index;
-                  const raw = row?.[sourceIndex];
-                  const kind = valueKind(raw, meta.column.binary);
+                  const cellKey = `${index}:${columnIndex}`;
+                  // A buffered edit is what the user typed, so show it rather
+                  // than the value the server still holds.
+                  const queued = buffer.current.get(cellKey);
+                  const raw = queued ? queued.value : row?.[sourceIndex];
+                  const kind = valueKind(raw, meta.column);
                   const isEditing =
                     editing?.row === index && editing?.column === columnIndex;
-                  const isPending = pending.has(`${index}:${columnIndex}`);
+                  const isPending = inFlight.has(cellKey);
                   const selected =
                     index >= rect.top &&
                     index <= rect.bottom &&
@@ -629,6 +732,7 @@ export function DataGrid({
                           focus.column === columnIndex &&
                           'ring-1 ring-inset ring-primary/70',
                         isPending && 'opacity-45',
+                        queued && 'bg-warning/12',
                         editable && !meta.column.binary && 'cursor-cell',
                       )}
                     >
@@ -637,18 +741,18 @@ export function DataGrid({
                           autoFocus
                           value={draft}
                           onChange={(event) => setDraft(event.target.value)}
-                          onBlur={() => void commit({ row: index, column: columnIndex }, draft)}
+                          onBlur={() => commit({ row: index, column: columnIndex }, draft)}
                           onKeyDown={(event) => {
                             if (event.key === 'Enter') {
                               event.preventDefault();
-                              void commit({ row: index, column: columnIndex }, draft);
+                              commit({ row: index, column: columnIndex }, draft);
                               moveFocus(1, 0, false);
                             } else if (event.key === 'Escape') {
                               event.preventDefault();
                               setEditing(null);
                             } else if (event.key === 'Tab') {
                               event.preventDefault();
-                              void commit({ row: index, column: columnIndex }, draft);
+                              commit({ row: index, column: columnIndex }, draft);
                               moveFocus(0, event.shiftKey ? -1 : 1, false);
                             }
                           }}

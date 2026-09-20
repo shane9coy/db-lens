@@ -136,7 +136,7 @@ export function SqlConsole({
                     <tr key={rowIndex} className="hover:bg-accent/30">
                       {result.columns.map((column, columnIndex) => {
                         const value = row[columnIndex];
-                        const kind = valueKind(value, column.binary);
+                        const kind = valueKind(value, column);
                         return (
                           <td
                             key={column.name}

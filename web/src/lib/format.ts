@@ -5,16 +5,35 @@ export type ValueKind = 'null' | 'number' | 'bigint' | 'boolean' | 'date' | 'bin
 const ISO_DATE = /^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?)?$/;
 const BINARY_MARKER = /^<blob (\d+) bytes>$/;
 
-/** Classify a value so the grid can style and align it. */
-export function valueKind(value: unknown, columnBinary = false): ValueKind {
+/** The bits of a column that decide how a value should be rendered. */
+export interface ColumnShape {
+  binary?: boolean;
+  type?: string;
+  affinity?: string;
+}
+
+const WHOLE_NUMBER = /int|numeric|decimal|number|bigint/;
+
+/**
+ * Classify a value so the grid can style and align it.
+ *
+ * The column matters, not just the value: an exact integer too large for a JS
+ * number crosses the wire as a digit string, and it should still render as a
+ * right-aligned number rather than as text.
+ */
+export function valueKind(value: unknown, column?: ColumnShape): ValueKind {
   // NULL is NULL whatever the column type — check it before anything else.
   if (value === null || value === undefined) return 'null';
-  if (columnBinary) return 'binary';
+  if (column?.binary) return 'binary';
   if (typeof value === 'number') return 'number';
   if (typeof value === 'boolean') return 'boolean';
   if (typeof value === 'bigint') return 'bigint';
   if (typeof value === 'string') {
     if (BINARY_MARKER.test(value)) return 'binary';
+    const shape = `${column?.affinity ?? ''} ${column?.type ?? ''}`.toLowerCase();
+    if (WHOLE_NUMBER.test(shape) && /^-?\d+$/.test(value) && value.replace('-', '').length > 15) {
+      return 'bigint';
+    }
     if (ISO_DATE.test(value)) return 'date';
     return 'text';
   }

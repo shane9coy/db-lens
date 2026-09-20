@@ -11,10 +11,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
-import XLSXModule from 'xlsx';
-
-// See server/adapters/excel.mjs — the CJS interop namespace is partial.
-const XLSX = XLSXModule?.default ?? XLSXModule;
+import XLSX from '../server/xlsx.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const DB = path.join(HERE, 'crm.sqlite');

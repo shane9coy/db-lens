@@ -75,7 +75,7 @@ export function PathBar({
               if (event.key === 'Enter') void submit();
             }}
             spellCheck={false}
-            placeholder="/path/to/data.sqlite  ·  ./folder  ·  ~/exports/book.xlsx"
+            placeholder="/path/to/data.sqlite  ·  ./folder  ·  postgres://user@host/db"
             className={cn(
               'h-8 w-full rounded-md border border-input bg-transparent pr-20 pl-6 font-mono text-[11px]',
               'outline-none placeholder:text-muted-foreground/50',

@@ -21,14 +21,36 @@ const MAX_LIMIT = 2000;
 const DEFAULT_LIMIT = 200;
 const INTERNAL = /^sqlite_/;
 
+/**
+ * Every page fetch asks for the exact total, which is a full scan — and paging
+ * through one filtered result repeats that identical scan per page. The count
+ * for a given (object, filter) is therefore memoised briefly. The TTL bounds
+ * staleness from another process writing the file; our own writes clear it.
+ */
+const COUNT_TTL_MS = 5000;
+const COUNT_CACHE_MAX = 64;
+
 export class SqliteAdapter {
   static kind = 'sqlite';
+
+  #counts = new Map();
 
   constructor(filePath) {
     this.kind = SqliteAdapter.kind;
     this.path = filePath;
     this._ro = null;
     this._rw = null;
+  }
+
+  #countOf(key, compute) {
+    const now = Date.now();
+    const hit = this.#counts.get(key);
+    if (hit && now - hit.at < COUNT_TTL_MS) return hit.total;
+
+    const total = compute();
+    if (this.#counts.size >= COUNT_CACHE_MAX) this.#counts.clear();
+    this.#counts.set(key, { total, at: now });
+    return total;
   }
 
   #openReadOnly() {
@@ -286,8 +308,9 @@ export class SqliteAdapter {
       orderSql = ` ORDER BY rowid ASC`;
     }
 
-    const total =
-      this.#metaOne(`SELECT COUNT(*) AS n FROM ${quoteIdent(name)}${whereSql}`, params)?.n ?? 0;
+    const total = this.#countOf(`${name}\u0000${whereSql}\u0000${q ?? ''}`, () =>
+      this.#metaOne(`SELECT COUNT(*) AS n FROM ${quoteIdent(name)}${whereSql}`, params)?.n ?? 0,
+    );
 
     const raw = this.#all(
       `SELECT ${selectList} FROM ${quoteIdent(name)}${whereSql}${orderSql} LIMIT ? OFFSET ?`,
@@ -465,6 +488,7 @@ export class SqliteAdapter {
         throw err;
       }
       db.exec('COMMIT');
+      this.#counts.clear();
     } catch (err) {
       try {
         db.exec('ROLLBACK');

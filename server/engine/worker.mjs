@@ -25,11 +25,11 @@ function engine() {
 }
 
 const HANDLERS = {
-  ping: () => {
-    // Constructing the adapter is what validates the file. Without this the
-    // import path registers unopenable files as healthy and every entry pays a
-    // worker spawn for no check at all.
-    engine().probe();
+  ping: async () => {
+    // Constructing the adapter is what validates the target, and `probe` is
+    // what actually reaches it — a connection string only fails on a round
+    // trip, not on construction.
+    await engine().probe();
     return { path: workerData.path, kind: workerData.kind };
   },
   listObjects: () => engine().listObjects(),

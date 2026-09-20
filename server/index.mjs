@@ -189,9 +189,9 @@ export function createServer({ dataDir, timeoutMs, localOnly = true } = {}) {
   route('GET', '/api/sources', () => ({ sources: manager.list() }));
 
   route('POST', '/api/sources', async (ctx) => {
-    const target = ctx.body?.path;
+    const target = ctx.body?.target ?? ctx.body?.path ?? ctx.body?.dsn;
     if (!target || typeof target !== 'string') {
-      const err = new Error('A file or folder path is required.');
+      const err = new Error('A file, folder or connection string is required.');
       err.status = 400;
       throw err;
     }

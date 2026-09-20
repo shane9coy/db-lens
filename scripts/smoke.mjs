@@ -11,15 +11,42 @@ import fs from 'node:fs';
 import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
-import { fileURLToPath } from 'node:url';
-import XLSXModule from 'xlsx';
+import { fileURLToPath, pathToFileURL } from 'node:url';
+import XLSX from '../server/xlsx.mjs';
+import { PostgresAdapter } from '../server/adapters/postgres.mjs';
 import { Engine } from '../server/engine/host.mjs';
 import { createServer, listen } from '../server/index.mjs';
 
-const XLSX = XLSXModule?.default ?? XLSXModule;
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const FIXTURES = path.resolve(HERE, '..', 'fixtures');
 const SCRATCH = fs.mkdtempSync(path.join(os.tmpdir(), 'dblens-smoke-'));
+
+/**
+ * The child processes below read a workbook the app just wrote. They import the
+ * same loader the app uses, because a bare `xlsx` import resolves to the ESM
+ * build, which has no filesystem bound and refuses to open anything.
+ */
+const XLSX_LOADER = JSON.stringify(pathToFileURL(path.join(HERE, '..', 'server', 'xlsx.mjs')).href);
+
+/** The container `npm run fixtures:pg` starts, unless you point it elsewhere. */
+const PG_DSN =
+  process.env.DB_LENS_PG_DSN ?? 'postgres://postgres:dblens@127.0.0.1:55432/dblens_test';
+
+/**
+ * Postgres coverage is skipped rather than failed when no server is listening,
+ * so the suite still runs green on a machine without Docker.
+ */
+async function postgresReachable(dsn) {
+  const adapter = new PostgresAdapter(dsn, { statementTimeoutMs: 3000 });
+  try {
+    await adapter.probe();
+    return true;
+  } catch {
+    return false;
+  } finally {
+    await adapter.close().catch(() => {});
+  }
+}
 
 /** Set from argv when you want to run against a server you started yourself. */
 let BASE = process.argv[2] ?? null;
@@ -217,10 +244,15 @@ async function body() {
   const insertRowid = await api('GET', `/api/sources/${sourceId}/objects/people/rows?limit=1`);
   const peopleNameIndex = insertRowid.body.columns.findIndex((c) => c.name === 'name');
   const peopleEmailIndex = insertRowid.body.columns.findIndex((c) => c.name === 'email');
+  // Read the total once more so a memoised count is definitely warm before the
+  // write; a stale total after a write would be invisible otherwise.
+  const totalBeforeInsert = (await api('GET', `/api/sources/${sourceId}/objects/people/rows?limit=1`)).body.total;
   const newPerson = await api('POST', `/api/sources/${sourceId}/objects/people/rows`, {
     ops: [{ op: 'insert', values: { name: 'Smoke Tester', email: 'smoke@db-lens.test', age: '41' } }],
   });
   eq('rowid insert applies', newPerson.status, 200);
+  const totalAfterInsert = (await api('GET', `/api/sources/${sourceId}/objects/people/rows?limit=1`)).body.total;
+  eq('a write invalidates the cached total', totalAfterInsert, totalBeforeInsert + 1);
   const personKey = newPerson.body.results[0].rowKey;
   const fetchedNew = await api('GET', `/api/sources/${sourceId}/objects/people/rows?q=smoke@db-lens.test`);
   eq('inserted row is queryable', fetchedNew.body.total, 1);
@@ -394,8 +426,7 @@ async function body() {
     [
       '--input-type=module',
       '-e',
-      `import XLSXModule from 'xlsx';
-       const XLSX = XLSXModule?.default ?? XLSXModule;
+      `import XLSX from ${XLSX_LOADER};
        const wb = XLSX.readFile(process.argv[1]);
        const ws = wb.Sheets['Inventory'];
        const range = XLSX.utils.decode_range(ws['!ref']);
@@ -417,8 +448,7 @@ async function body() {
     [
       '--input-type=module',
       '-e',
-      `import XLSXModule from 'xlsx';
-       const XLSX = XLSXModule?.default ?? XLSXModule;
+      `import XLSX from ${XLSX_LOADER};
        const wb = XLSX.readFile(process.argv[1], { cellDates: true });
        const ws = wb.Sheets['Inventory'];
        ws.A2 = { t: 's', v: 'EXTERNAL-CHANGE' };
@@ -706,6 +736,176 @@ async function body() {
   }
   check('the next request succeeds on the respawned engine', typeof recovered === 'number' && recovered > 0, String(recovered));
   await engine.close();
+
+  // ------------------------------------------------------------- postgres
+  section('PostgreSQL source');
+
+  if (!(await postgresReachable(PG_DSN))) {
+    console.log(
+      `  \u001b[33m—\u001b[0m skipped: nothing listening at ${PG_DSN}\n` +
+        '    start one with: npm run fixtures:pg',
+    );
+  } else {
+    const addedPg = await api('POST', '/api/sources', { dsn: PG_DSN });
+    eq('a connection string registers', addedPg.status, 200);
+    const pg = addedPg.body.added[0];
+    eq('detected as postgres', pg.kind, 'postgres');
+    check('the password is masked', pg.path.includes(':***@'), pg.path);
+    check('the password itself is gone', !pg.path.includes(':dblens@'), pg.path);
+    check('the rest of the string survives redaction', pg.path.startsWith('postgres://'), pg.path);
+    const pgId = pg.id;
+
+    const pgObjects = await api('GET', `/api/sources/${pgId}/objects`);
+    const pgNames = pgObjects.body.objects.map((o) => o.name).sort();
+    check('objects are schema-qualified', pgNames.includes('public.customers'), JSON.stringify(pgNames));
+    check('a view is listed', pgObjects.body.objects.some((o) => o.type === 'view'));
+    const audit = pgObjects.body.objects.find((o) => o.name === 'public.audit_log');
+    eq('a table with no primary key is not editable', audit.editable, false);
+    eq('its row count is flagged as an estimate', audit.rowCountEstimated, true);
+
+    const pgSchema = await api(
+      'GET',
+      `/api/sources/${pgId}/objects/${encodeURIComponent('public.customers')}/schema`,
+    );
+    eq('the primary key is the row identity', pgSchema.body.rowIdentity, 'pk');
+    eq('and names the key column', pgSchema.body.pkColumns[0], 'id');
+    eq('an exact row count is reported', pgSchema.body.rowCount, 5000);
+    check(
+      'declared types come from the catalogue',
+      pgSchema.body.columns.find((c) => c.name === 'balance').type.startsWith('numeric'),
+      JSON.stringify(pgSchema.body.columns.find((c) => c.name === 'balance')),
+    );
+    check('indexes are listed', pgSchema.body.indexes.some((i) => i.name === 'ix_customers_age'));
+
+    const pgRows = await api(
+      'GET',
+      `/api/sources/${pgId}/objects/${encodeURIComponent('public.customers')}/rows?limit=3`,
+    );
+    eq('rows load', pgRows.body.rows.length, 3);
+    eq('the total is exact', pgRows.body.total, 5000);
+    check('row keys are returned', pgRows.body.rowKeys[0].startsWith('["pk"'));
+
+    const joinedIndex = pgRows.body.columns.findIndex((c) => c.name === 'joined');
+    check(
+      'a date stays a calendar date',
+      /^\d{4}-\d{2}-\d{2}$/.test(String(pgRows.body.rows[0][joinedIndex])),
+      String(pgRows.body.rows[0][joinedIndex]),
+    );
+
+    const bigPg = await api(
+      'GET',
+      `/api/sources/${pgId}/objects/${encodeURIComponent('public.customers')}/rows?q=user97%40example.com`,
+    );
+    const pgBigIndex = bigPg.body.columns.findIndex((c) => c.name === 'big_id');
+    check(
+      'an int8 past 2^53 keeps its exact digits',
+      typeof bigPg.body.rows[0][pgBigIndex] === 'string' &&
+        /^\d{16}$/.test(bigPg.body.rows[0][pgBigIndex]),
+      JSON.stringify(bigPg.body.rows[0][pgBigIndex]),
+    );
+
+    const pgFiltered = await api(
+      'GET',
+      `/api/sources/${pgId}/objects/${encodeURIComponent('public.customers')}/rows?q=Lovelace&limit=5`,
+    );
+    check('filtering works', pgFiltered.body.total > 0 && pgFiltered.body.total < 5000, `${pgFiltered.body.total}`);
+
+    const pgSorted = await api(
+      'GET',
+      `/api/sources/${pgId}/objects/${encodeURIComponent('public.orders')}/rows?sort=id&dir=desc&limit=3`,
+    );
+    const orderIds = pgSorted.body.rows.map((r) => r[pgSorted.body.columns.findIndex((c) => c.name === 'id')]);
+    check('sorting is direction-sensitive', orderIds[0] > orderIds[1] && orderIds[1] > orderIds[2], JSON.stringify(orderIds));
+
+    const pgTail = await api(
+      'GET',
+      `/api/sources/${pgId}/objects/${encodeURIComponent('public.customers')}/rows?limit=2000&offset=4000`,
+    );
+    eq('the last partial page is not truncated', pgTail.body.truncated, false);
+    eq('and has the remainder', pgTail.body.rows.length, 1000);
+
+    // The write gate is the same one the file sources use, and it is checked
+    // before the object-level read-only rule.
+    const pgGate = await api('POST', `/api/sources/${pgId}/objects/${encodeURIComponent('public.settings')}/rows`, {
+      ops: [{ op: 'insert', values: { key: 'gated', value: 'x' } }],
+    });
+    eq('writes are refused while edit mode is off', pgGate.status, 403);
+    await api('PATCH', `/api/sources/${pgId}`, { editEnabled: true });
+
+    // Read-only refusal, matching the SQLite rule.
+    const viewWrite = await api('POST', `/api/sources/${pgId}/objects/${encodeURIComponent('public.v_order_totals')}/rows`, {
+      ops: [{ op: 'delete', rowKey: '["pk",[1]]' }],
+    });
+    eq('a view refuses a write with edit mode on', viewWrite.status, 400);
+    const auditWrite = await api('POST', `/api/sources/${pgId}/objects/${encodeURIComponent('public.audit_log')}/rows`, {
+      ops: [{ op: 'delete', rowKey: '["pk",[1]]' }],
+    });
+    eq('a table with no primary key refuses a write', auditWrite.status, 400);
+
+    const settingsRows = await api(
+      'GET',
+      `/api/sources/${pgId}/objects/${encodeURIComponent('public.settings')}/rows`,
+    );
+    const keyAt = settingsRows.body.columns.findIndex((c) => c.name === 'key');
+    const valueAt = settingsRows.body.columns.findIndex((c) => c.name === 'value');
+    const currencyAt = settingsRows.body.rows.findIndex((r) => r[keyAt] === 'currency');
+
+    const pgUpdate = await api('POST', `/api/sources/${pgId}/objects/${encodeURIComponent('public.settings')}/rows`, {
+      ops: [{ op: 'update', rowKey: settingsRows.body.rowKeys[currencyAt], column: 'value', value: 'EUR' }],
+    });
+    eq('update applies', pgUpdate.status, 200);
+    const afterUpdate = await api('GET', `/api/sources/${pgId}/objects/${encodeURIComponent('public.settings')}/rows`);
+    eq('and is visible on reload', afterUpdate.body.rows.find((r) => r[keyAt] === 'currency')[valueAt], 'EUR');
+
+    const pgInsert = await api('POST', `/api/sources/${pgId}/objects/${encodeURIComponent('public.settings')}/rows`, {
+      ops: [{ op: 'insert', values: { key: 'smoke_pg', value: 'inserted' } }],
+    });
+    eq('insert applies', pgInsert.status, 200);
+    const pgDelete = await api('POST', `/api/sources/${pgId}/objects/${encodeURIComponent('public.settings')}/rows`, {
+      ops: [{ op: 'delete', rowKey: pgInsert.body.results[0].rowKey }],
+    });
+    eq('delete applies', pgDelete.status, 200);
+
+    // Restore the fixture so reruns start clean.
+    await api('POST', `/api/sources/${pgId}/objects/${encodeURIComponent('public.settings')}/rows`, {
+      ops: [{ op: 'update', rowKey: settingsRows.body.rowKeys[currencyAt], column: 'value', value: 'USD' }],
+    });
+    const restored = await api('GET', `/api/sources/${pgId}/objects/${encodeURIComponent('public.settings')}/rows`);
+    eq('the fixture is left as it was found', restored.body.total, 5);
+
+    const stalePg = await api('POST', `/api/sources/${pgId}/objects/${encodeURIComponent('public.settings')}/rows`, {
+      ops: [{ op: 'delete', rowKey: '["pk",["no-such-key"]]' }],
+    });
+    eq('a missing row is a conflict', stalePg.status, 409);
+
+    const pgConsole = await api('POST', `/api/sources/${pgId}/query`, {
+      sql: 'SELECT status, count(*) AS n FROM orders GROUP BY status ORDER BY n DESC',
+    });
+    eq('the SQL console runs on Postgres', pgConsole.status, 200);
+    check('and returns the groups', pgConsole.body.rows.length >= 4, JSON.stringify(pgConsole.body.rows));
+
+    const pgCap = await api('POST', `/api/sources/${pgId}/query`, {
+      sql: 'SELECT * FROM customers',
+      limit: 10,
+    });
+    eq('a full scan is capped, not materialised', pgCap.body.rows.length, 10);
+    eq('and reports truncation', pgCap.body.truncated, true);
+
+    const pgGuard = await api('POST', `/api/sources/${pgId}/query`, { sql: 'DELETE FROM settings' });
+    eq('the guard blocks a write before it reaches the server', pgGuard.status, 400);
+
+    // A bad connection string must fail the add, not register a dead source.
+    const before = (await api('GET', '/api/sources')).body.sources.length;
+    const unreachable = await api('POST', '/api/sources', {
+      dsn: 'postgres://postgres:dblens@127.0.0.1:1/nope',
+    });
+    check('an unreachable server is reported', unreachable.status >= 400, String(unreachable.status));
+    const after = (await api('GET', '/api/sources')).body.sources.length;
+    eq('and leaves nothing registered', after, before);
+
+    await api('DELETE', `/api/sources/${pgId}`);
+    check('the source can be removed', !(await api('GET', '/api/sources')).body.sources.some((s) => s.id === pgId));
+  }
 
   // ------------------------------------------------------------------ report
   console.log('');

@@ -4,18 +4,37 @@
  * Engines are keyed by source id and recreated when the underlying file is
  * *replaced* (different inode), which is what happens when a tool rewrites a
  * file next to a running DB Lens. In-place edits need no special handling:
- * SQLite re-reads pages and the Excel adapter tracks mtime itself.
+ * SQLite re-reads pages and the Excel adapter tracks mtime itself. A network
+ * source has no inode, so it keeps one long-lived engine.
  */
 
 import fs from 'node:fs';
 import path from 'node:path';
-import { detectKind, supportsEdit, supportsSql } from './adapters/index.mjs';
+import {
+  detectKind,
+  isConnectionString,
+  isFileKind,
+  supportsEdit,
+  supportsSql,
+} from './adapters/index.mjs';
 import { Engine, DEFAULT_TIMEOUT_MS } from './engine/host.mjs';
 import { scanFolder } from './scan.mjs';
+import { redactDsn } from './util.mjs';
 
 const MAX_FOLDER_IMPORTS = 300;
 /** How many files are validated at once during a folder import. */
 const IMPORT_CONCURRENCY = 8;
+
+/** Readable label for a connection string, since it has no basename. */
+function connectionLabel(target) {
+  try {
+    const url = new URL(target);
+    const database = url.pathname.replace(/^\//, '') || 'postgres';
+    return `${database} @ ${url.hostname}`;
+  } catch {
+    return 'postgres';
+  }
+}
 
 export class SourceManager {
   #registry;
@@ -27,9 +46,10 @@ export class SourceManager {
     this.#timeoutMs = timeoutMs;
   }
 
-  #signature(filePath) {
+  #signature(source) {
+    if (!isFileKind(source.kind)) return `dsn:${source.path}`;
     try {
-      const stat = fs.statSync(filePath);
+      const stat = fs.statSync(source.path);
       return `${stat.dev}:${stat.ino}`;
     } catch {
       return null;
@@ -37,7 +57,7 @@ export class SourceManager {
   }
 
   #engine(source) {
-    const signature = this.#signature(source.path);
+    const signature = this.#signature(source);
     const existing = this.#engines.get(source.id);
     if (existing) {
       if (existing.signature === signature) return existing.engine;
@@ -73,9 +93,14 @@ export class SourceManager {
    * UI rendering an edit switch against an undefined capability.
    */
   #decorate(source) {
+    const isFile = isFileKind(source.kind);
     return {
       ...source,
-      exists: fs.existsSync(source.path),
+      // The connection string is redacted on the way out; the engine keeps the
+      // real one. A network source is never "gone" — an unreachable server
+      // surfaces as an error on the request instead.
+      path: isFile ? source.path : redactDsn(source.path),
+      exists: isFile ? fs.existsSync(source.path) : true,
       canQuery: supportsSql(source.kind),
       canEdit: supportsEdit(source.kind),
     };
@@ -96,26 +121,49 @@ export class SourceManager {
     return this.#decorate(source);
   }
 
-  #register(filePath) {
-    const absolute = path.resolve(filePath);
-    const kind = detectKind(absolute);
-    if (!fs.existsSync(absolute)) {
-      const err = new Error(`No such file: ${absolute}`);
+  #register(target) {
+    const kind = detectKind(target);
+    const isFile = isFileKind(kind);
+    const resolved = isFile ? path.resolve(target) : String(target);
+
+    if (isFile && !fs.existsSync(resolved)) {
+      const err = new Error(`No such file: ${resolved}`);
       err.status = 404;
       throw err;
     }
+
     return this.#registry.upsert({
-      name: path.basename(absolute),
+      name: isFile ? path.basename(resolved) : connectionLabel(resolved),
       kind,
-      path: absolute,
+      path: resolved,
     });
   }
 
   /**
-   * Register a file, or every openable file under a directory.
-   * Returns `{ added, scanned, truncated }`.
+   * Register a file, every openable file under a directory, or a connection
+   * string. Returns `{ added, failed, scanned, truncated }`.
    */
   async add(target) {
+    if (typeof target !== 'string' || target.trim() === '') {
+      const err = new Error('A file, folder or connection string is required.');
+      err.status = 400;
+      throw err;
+    }
+
+    // A connection string is checked first: it is never a path, so it must not
+    // reach the fs calls below, and it has no directory to scan.
+    if (isConnectionString(target)) {
+      const source = this.#register(target);
+      try {
+        await this.#engine(source).call('ping', {}, { timeoutMs: 20_000 });
+      } catch (err) {
+        this.#registry.remove(source.id);
+        await this.drop(source.id);
+        throw err;
+      }
+      return { added: [this.#decorate(source)], failed: [], scanned: 1, truncated: false };
+    }
+
     const absolute = path.resolve(target);
     let stat;
     try {
@@ -126,6 +174,8 @@ export class SourceManager {
       throw err;
     }
 
+    // A folder has no extension to classify, so kind detection has to wait
+    // until we know this is a file.
     if (stat.isDirectory()) {
       const { files, truncated } = scanFolder(absolute);
       const slice = files.slice(0, MAX_FOLDER_IMPORTS);
@@ -191,7 +241,7 @@ export class SourceManager {
       err.status = 404;
       throw err;
     }
-    if (!fs.existsSync(source.path)) {
+    if (isFileKind(source.kind) && !fs.existsSync(source.path)) {
       const err = new Error(`File is gone: ${source.path}`);
       err.status = 410;
       throw err;

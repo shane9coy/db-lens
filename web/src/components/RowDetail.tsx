@@ -83,7 +83,7 @@ export function RowDetail({
 
         <div className="min-h-0 flex-1 overflow-y-auto rounded border border-border">
           {entries.map(({ column, value }, index) => {
-            const kind = valueKind(value, column.binary);
+            const kind = valueKind(value, column);
             return (
               <div
                 key={column.colIndex ?? index}

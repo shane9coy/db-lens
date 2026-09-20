@@ -7,6 +7,7 @@ import {
   FileText,
   Lock,
   Plus,
+  Server,
   Table2,
   Trash2,
   Unlock,
@@ -20,6 +21,7 @@ const KIND_ICON: Record<SourceKind, LucideIcon> = {
   sqlite: Database,
   excel: FileSpreadsheet,
   csv: FileText,
+  postgres: Server,
 };
 
 export function SourceRail({
@@ -202,6 +204,7 @@ export function SourceRail({
                             )}
                             <span className="truncate font-mono text-[11px]">{object.name}</span>
                             <span className="ml-auto shrink-0 font-mono text-[10px] text-muted-foreground/60 tabular">
+                              {object.rowCountEstimated ? '~' : ''}
                               {formatCount(object.rowCount)}
                             </span>
                           </button>

@@ -1,4 +1,4 @@
-import { Database, FileSpreadsheet, FileText, Lock, Timer, Unlock } from 'lucide-react';
+import { Database, FileSpreadsheet, FileText, Lock, Server, Timer, Unlock } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
 import type { Source, SourceKind } from '@/lib/api';
 import { formatCount } from '@/lib/format';
@@ -8,12 +8,14 @@ const KIND_LABEL: Record<SourceKind, string> = {
   sqlite: 'SQLite',
   excel: 'Excel',
   csv: 'CSV',
+  postgres: 'Postgres',
 };
 
 const KIND_ICON: Record<SourceKind, LucideIcon> = {
   sqlite: Database,
   excel: FileSpreadsheet,
   csv: FileText,
+  postgres: Server,
 };
 
 export function StatusBar({

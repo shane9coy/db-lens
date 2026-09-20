@@ -2,18 +2,21 @@
  * Adapter registry.
  *
  * Every adapter exposes the same calls — `probe`, `listObjects`, `getSchema`,
- * `getRows`, `mutate`, `close` — plus a SQLite-only `query`. The HTTP layer and
- * the UI never branch on source kind; they read the capabilities this file
- * declares (or, for the header-row concept, a flag the adapter itself reports).
+ * `getRows`, `mutate`, `close` — plus a `query` where SQL makes sense. The HTTP
+ * layer and the UI never branch on source kind; they read the capabilities this
+ * file declares (or, for the header-row concept, a flag the adapter reports).
  *
  * Construction and capability live in the same table so they cannot drift: a
  * kind that opens but declares no capability would silently hide the SQL
- * console rather than fail.
+ * console rather than fail. `file` records whether the target is a filesystem
+ * path, which is what lets a connection string skip the existence and
+ * staleness checks that only make sense for a file.
  */
 
 import fs from 'node:fs';
 import path from 'node:path';
 import { ExcelAdapter } from './excel.mjs';
+import { PostgresAdapter } from './postgres.mjs';
 import { SqliteAdapter } from './sqlite.mjs';
 
 export const SQLITE_EXTENSIONS = ['.sqlite', '.sqlite3', '.db', '.db3'];
@@ -21,30 +24,45 @@ export const SPREADSHEET_EXTENSIONS = ['.xlsx', '.xlsm', '.xls', '.csv', '.tsv',
 export const SUPPORTED_EXTENSIONS = [...SQLITE_EXTENSIONS, ...SPREADSHEET_EXTENSIONS];
 
 const EXCEL_EXTENSIONS = ['.xlsx', '.xlsm', '.xls'];
+const POSTGRES_URL = /^postgres(ql)?:\/\//i;
 
 const ADAPTERS = {
-  sqlite: { Adapter: SqliteAdapter, sql: true, edit: true },
-  excel: { Adapter: ExcelAdapter, sql: false, edit: true },
-  csv: { Adapter: ExcelAdapter, sql: false, edit: true },
+  sqlite: { Adapter: SqliteAdapter, sql: true, edit: true, file: true },
+  excel: { Adapter: ExcelAdapter, sql: false, edit: true, file: true },
+  csv: { Adapter: ExcelAdapter, sql: false, edit: true, file: true },
+  postgres: { Adapter: PostgresAdapter, sql: true, edit: true, file: false },
 };
 
 const REQUIRED_METHODS = ['probe', 'listObjects', 'getSchema', 'getRows', 'mutate', 'close'];
 
-/** Decide which adapter owns a path, or throw a 400 with a useful message. */
-export function detectKind(filePath) {
-  const ext = path.extname(filePath).toLowerCase();
+/** True when a source kind is addressed by a path on disk. */
+export function isFileKind(kind) {
+  return ADAPTERS[kind]?.file === true;
+}
+
+/** A connection string is recognised by scheme, everything else by extension. */
+export function isConnectionString(target) {
+  return POSTGRES_URL.test(String(target ?? ''));
+}
+
+/** Decide which adapter owns a target, or throw a 400 with a useful message. */
+export function detectKind(target) {
+  if (isConnectionString(target)) return 'postgres';
+
+  const ext = path.extname(String(target)).toLowerCase();
   if (SQLITE_EXTENSIONS.includes(ext)) return 'sqlite';
   if (SPREADSHEET_EXTENSIONS.includes(ext)) return EXCEL_EXTENSIONS.includes(ext) ? 'excel' : 'csv';
 
   const err = new Error(
-    `Unsupported file type "${ext || '(none)'}". Try one of: ${SUPPORTED_EXTENSIONS.join(', ')}`,
+    `Unsupported target "${ext || '(no extension)'}". Use one of: ` +
+      `${SUPPORTED_EXTENSIONS.join(', ')}, or a postgres:// connection string.`,
   );
   err.status = 400;
   throw err;
 }
 
-/** Instantiate the adapter for a path. Throws if the file is missing. */
-export function openAdapter(kind, filePath) {
+/** Instantiate the adapter for a target. Throws if a file target is missing. */
+export function openAdapter(kind, target) {
   const entry = ADAPTERS[kind];
   if (!entry) {
     const err = new Error(`No adapter for source kind "${kind}".`);
@@ -52,19 +70,21 @@ export function openAdapter(kind, filePath) {
     throw err;
   }
 
-  if (!fs.existsSync(filePath)) {
-    const err = new Error(`No such file: ${filePath}`);
-    err.status = 404;
-    throw err;
-  }
-  const stat = fs.statSync(filePath);
-  if (!stat.isFile()) {
-    const err = new Error(`Not a file: ${filePath}`);
-    err.status = 400;
-    throw err;
+  if (entry.file) {
+    if (!fs.existsSync(target)) {
+      const err = new Error(`No such file: ${target}`);
+      err.status = 404;
+      throw err;
+    }
+    const stat = fs.statSync(target);
+    if (!stat.isFile()) {
+      const err = new Error(`Not a file: ${target}`);
+      err.status = 400;
+      throw err;
+    }
   }
 
-  const adapter = new entry.Adapter(filePath);
+  const adapter = new entry.Adapter(target);
   for (const method of REQUIRED_METHODS) {
     if (typeof adapter[method] !== 'function') {
       const err = new Error(`Adapter for "${kind}" does not implement ${method}().`);

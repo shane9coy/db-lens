@@ -5,6 +5,7 @@ import {
   FileText,
   Loader2,
   Search,
+  Server,
   Table2,
 } from 'lucide-react';
 import type { LucideIcon } from 'lucide-react';
@@ -18,6 +19,7 @@ const KIND_ICON: Record<SourceKind, LucideIcon> = {
   sqlite: Database,
   excel: FileSpreadsheet,
   csv: FileText,
+  postgres: Server,
 };
 
 interface Entry {

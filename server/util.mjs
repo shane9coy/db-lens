@@ -87,3 +87,25 @@ export function coerceForAffinity(affinity, value) {
   }
   return value;
 }
+
+/**
+ * A connection string may carry a password. Nothing that leaves the process —
+ * an API response, a CLI banner, a log line — should contain it.
+ *
+ * Built by hand rather than through `URL`, whose serialiser percent-encodes
+ * anything non-ASCII in the userinfo and would turn a mask into noise.
+ */
+export function redactDsn(target) {
+  const text = String(target ?? '');
+  const schemeEnd = text.indexOf('://');
+  if (schemeEnd < 0 || !/^postgres(ql)?$/i.test(text.slice(0, schemeEnd))) return text;
+
+  const userinfoStart = schemeEnd + 3;
+  const at = text.lastIndexOf('@');
+  if (at < userinfoStart) return text; // no userinfo at all
+
+  const colon = text.indexOf(':', userinfoStart);
+  if (colon < 0 || colon > at) return text; // user with no password
+
+  return `${text.slice(0, colon)}:***${text.slice(at)}`;
+}

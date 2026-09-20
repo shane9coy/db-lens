@@ -281,10 +281,16 @@ async function main() {
   prompt();
 }
 
-process.on('SIGINT', () => {
-  process.stdout.write('\n');
-  process.exit(0);
-});
+// A worker retired on a deadline can still be inside native SQLite, which Node
+// cannot interrupt, and Node joins worker threads at exit — so a runaway
+// statement can hold the process open until it finishes. An explicit signal
+// exits immediately instead.
+for (const signal of ['SIGINT', 'SIGTERM']) {
+  process.on(signal, () => {
+    if (signal === 'SIGINT') process.stdout.write('\n');
+    process.exit(0);
+  });
+}
 
 main().catch((err) => {
   console.error(red(`db-lens failed to start: ${err.message}`));

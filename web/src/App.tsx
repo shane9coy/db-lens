@@ -5,6 +5,7 @@ import {
   FileText,
   Loader2,
   PanelRight,
+  Server,
   Table2,
   Terminal,
 } from 'lucide-react';
@@ -618,6 +619,7 @@ export default function App() {
 
 const KIND_HINTS: Array<{ icon: typeof Database; label: string; detail: string }> = [
   { icon: Database, label: 'SQLite', detail: '.sqlite · .sqlite3 · .db · .db3' },
+  { icon: Server, label: 'Postgres', detail: 'postgres://user@host:5432/db' },
   { icon: FileSpreadsheet, label: 'Excel', detail: '.xlsx · .xlsm · .xls' },
   { icon: FileText, label: 'Delimited', detail: '.csv · .tsv' },
 ];

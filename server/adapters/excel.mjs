@@ -13,12 +13,7 @@
 import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import XLSXModule from 'xlsx';
-
-// xlsx ships no `exports` map, so Node loads the CJS build and synthesises a
-// *partial* named-export namespace (`readFile` is absent, `utils` is present).
-// The default export is the complete object; prefer it when it is there.
-const XLSX = XLSXModule?.default ?? XLSXModule;
+import XLSX from '../xlsx.mjs';
 
 const MAX_LIMIT = 2000;
 const DEFAULT_LIMIT = 200;

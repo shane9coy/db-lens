@@ -5,7 +5,7 @@
  * duplicate spreadsheet headers unambiguous and the 50k-row pages small.
  */
 
-export type SourceKind = 'sqlite' | 'excel' | 'csv';
+export type SourceKind = 'sqlite' | 'excel' | 'csv' | 'postgres';
 
 export interface Source {
   id: number;
@@ -25,6 +25,8 @@ export interface SourceObject {
   type: string;
   editable: boolean;
   rowCount: number | null;
+  /** Postgres reports the planner's estimate until a table is actually opened. */
+  rowCountEstimated?: boolean;
   columns: number;
 }
 

@@ -1,0 +1,135 @@
+/**
+ * Engine host — the main-thread half of a per-source worker thread.
+ *
+ * Every call carries a deadline. A handler that overruns (a pathological join,
+ * a giant workbook) gets its worker terminated rather than wedging the server;
+ * the next call transparently spins a fresh worker up.
+ */
+
+import { Worker } from 'node:worker_threads';
+
+const WORKER_URL = new URL('./worker.mjs', import.meta.url);
+
+export class EngineError extends Error {
+  constructor(message, { status = 500, code = null } = {}) {
+    super(message);
+    this.name = 'EngineError';
+    this.status = status;
+    this.code = code;
+  }
+}
+
+export const DEFAULT_TIMEOUT_MS = 20_000;
+
+export class Engine {
+  #path;
+  #kind;
+  #timeoutMs;
+  #worker = null;
+  #pending = new Map();
+  #seq = 0;
+  #closed = false;
+
+  constructor({ path, kind, timeoutMs = DEFAULT_TIMEOUT_MS }) {
+    this.#path = path;
+    this.#kind = kind;
+    this.#timeoutMs = timeoutMs;
+  }
+
+  get path() {
+    return this.#path;
+  }
+
+  get kind() {
+    return this.#kind;
+  }
+
+  #spawn() {
+    if (this.#worker) return this.#worker;
+
+    const worker = new Worker(WORKER_URL, {
+      workerData: { path: this.#path, kind: this.#kind },
+      name: `dblens:${this.#kind}:${this.#path}`,
+      // Workers always run a real file. Inheriting the parent's execArgv drags
+      // in flags like `--input-type`/`--eval` that only apply to string input
+      // and abort the thread on startup.
+      execArgv: [],
+    });
+
+    worker.on('message', (message) => {
+      const entry = this.#pending.get(message.id);
+      if (!entry) return;
+      this.#pending.delete(message.id);
+      clearTimeout(entry.timer);
+      if (message.ok) entry.resolve(message.result);
+      else {
+        entry.reject(
+          new EngineError(message.error.message, {
+            status: message.error.status ?? 500,
+            code: message.error.code,
+          }),
+        );
+      }
+    });
+
+    worker.on('error', (err) => {
+      this.#failAll(new EngineError(`Engine crashed: ${err.message}`));
+      this.#worker = null;
+    });
+
+    worker.on('exit', () => {
+      if (this.#worker === worker) this.#worker = null;
+      this.#failAll(new EngineError('Engine stopped before the request finished.'));
+    });
+
+    this.#worker = worker;
+    return worker;
+  }
+
+  #failAll(error) {
+    for (const [, entry] of this.#pending) {
+      clearTimeout(entry.timer);
+      entry.reject(error);
+    }
+    this.#pending.clear();
+  }
+
+  /** Run `method` in the worker, rejecting if it exceeds the deadline. */
+  call(method, params = {}, { timeoutMs } = {}) {
+    if (this.#closed) {
+      return Promise.reject(new EngineError('Engine is closed.', { status: 503 }));
+    }
+
+    const worker = this.#spawn();
+    const id = (this.#seq += 1);
+    const budget = timeoutMs ?? this.#timeoutMs;
+
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.#pending.delete(id);
+        // The worker is wedged in synchronous work; the only way out is to
+        // kill the thread. Pending siblings fail with it.
+        const error = new EngineError(
+          `Request timed out after ${Math.round(budget / 1000)}s and the engine was restarted.`,
+          { status: 504 },
+        );
+        this.#failAll(error);
+        worker.terminate().catch(() => {});
+        this.#worker = null;
+        reject(error);
+      }, budget);
+      timer.unref?.();
+
+      this.#pending.set(id, { resolve, reject, timer });
+      worker.postMessage({ id, method, params });
+    });
+  }
+
+  async close() {
+    this.#closed = true;
+    const worker = this.#worker;
+    this.#worker = null;
+    this.#failAll(new EngineError('Engine closed.', { status: 503 }));
+    if (worker) await worker.terminate().catch(() => {});
+  }
+}

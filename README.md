@@ -265,6 +265,23 @@ keeps duplicate spreadsheet headers unambiguous and keeps large pages small.
 back when it mutates something, so the UI never needs to know whether a row is
 addressed by `rowid`, by a composite primary key, or by a Postgres primary key.
 
+## License
+
+Copyright (C) 2026 shane9coy
+
+DB Lens is free software: you can redistribute it and/or modify it under the
+terms of the **GNU General Public License, version 3 or later**, as published by
+the Free Software Foundation. The full text is in [LICENSE](LICENSE).
+
+It comes with no warranty, to the extent permitted by law.
+
+In practice that means: use it, read it, change it, share it — but if you
+distribute a modified version, it has to stay under the same licence, and your
+users have to get the source. Nobody can take this, close the source, and ship
+it as their own. (If you ever want to stop someone running it as a paid hosted
+service, the [AGPL](https://www.gnu.org/licenses/agpl-3.0.html) covers that
+case too — a one-line change to this section and the `LICENSE` file.)
+
 ## Not built yet
 
 - **A VS Code webview wrapper** around the same UI.

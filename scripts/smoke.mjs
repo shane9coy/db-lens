@@ -8,14 +8,22 @@
  */
 
 import fs from 'node:fs';
+import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import XLSXModule from 'xlsx';
+import { Engine } from '../server/engine/host.mjs';
+import { createServer, listen } from '../server/index.mjs';
 
-const BASE = process.argv[2] ?? 'http://127.0.0.1:4399';
+const XLSX = XLSXModule?.default ?? XLSXModule;
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const FIXTURES = path.resolve(HERE, '..', 'fixtures');
 const SCRATCH = fs.mkdtempSync(path.join(os.tmpdir(), 'dblens-smoke-'));
+
+/** Set from argv when you want to run against a server you started yourself. */
+let BASE = process.argv[2] ?? null;
+let app = null;
 
 let passed = 0;
 const failures = [];
@@ -60,7 +68,7 @@ function copyFixture(name) {
   return target;
 }
 
-async function main() {
+async function body() {
   const health = await api('GET', '/api/health');
   check('health responds', health.status === 200 && health.body.ok === true, JSON.stringify(health.body));
 
@@ -83,6 +91,7 @@ async function main() {
   eq('lists objects', objects.status, 200);
   const names = objects.body.objects.map((o) => o.name).sort();
   eq('finds every table and view', names, [
+    'audit_log',
     'order_lines',
     'orders',
     'people',
@@ -461,6 +470,243 @@ async function main() {
   eq('sources can be removed', dropped.status, 200);
   check('the removed source is gone', !dropped.body.sources.some((s) => s.id === csvId));
 
+  // ------------------------------------------------- regression for review
+  section('Read-only refusal is enforced, not just advertised');
+
+  const viewWrite = await api('POST', `/api/sources/${sourceId}/objects/v_order_totals/rows`, {
+    ops: [{ op: 'delete', rowKey: '["r",1]' }],
+  });
+  eq('a view refuses a write with edit mode on', viewWrite.status, 400);
+
+  const auditSchema = await api('GET', `/api/sources/${sourceId}/objects/audit_log/schema`);
+  eq('a rowid-shadowed table has no row identity', auditSchema.body.rowIdentity, 'none');
+  eq('and is not editable', auditSchema.body.editable, false);
+  const auditRows = await api('GET', `/api/sources/${sourceId}/objects/audit_log/rows?limit=3`);
+  eq('but still lists rows', auditRows.body.rows.length, 3);
+  eq('with no row keys', auditRows.body.rowKeys, null);
+  const auditWrite = await api('POST', `/api/sources/${sourceId}/objects/audit_log/rows`, {
+    ops: [{ op: 'delete', rowKey: '["r",1]' }],
+  });
+  eq('and refuses a write', auditWrite.status, 400);
+
+  section('Integer precision survives a write');
+
+  const bigRows = await api('GET', `/api/sources/${sourceId}/objects/people/rows?limit=1`);
+  const bigCol = bigRows.body.columns.findIndex((c) => c.name === 'big_id');
+  const exact = '9007199254740993';
+  const bigWrite = await api('POST', `/api/sources/${sourceId}/objects/people/rows`, {
+    ops: [{ op: 'update', rowKey: bigRows.body.rowKeys[0], column: 'big_id', value: exact }],
+  });
+  eq('an oversize integer write is accepted', bigWrite.status, 200);
+  const bigRead = await api('GET', `/api/sources/${sourceId}/objects/people/rows?limit=1`);
+  eq('and stored exactly', bigRead.body.rows[0][bigCol], exact);
+
+  section('Paging boundaries');
+
+  const full = await api('GET', `/api/sources/${sourceId}/objects/people/rows?limit=2000&offset=0`);
+  eq('a full page returns the limit', full.body.rows.length, 2000);
+  eq('and reports itself truncated', full.body.truncated, true);
+  const lastPage = await api('GET', `/api/sources/${sourceId}/objects/people/rows?limit=2000&offset=4000`);
+  eq('the last partial page has the remainder', lastPage.body.rows.length, 1000);
+  eq('and is not truncated', lastPage.body.truncated, false);
+  const past = await api('GET', `/api/sources/${sourceId}/objects/people/rows?limit=10&offset=999999`);
+  eq('an offset past the end returns nothing', past.body.rows.length, 0);
+  eq('but still reports the total', past.body.total, 5000);
+  const fractional = await api('GET', `/api/sources/${sourceId}/objects/people/rows?limit=2.9`);
+  eq('a fractional limit is floored, not an error', fractional.status, 200);
+  eq('and floors to 2', fractional.body.rows.length, 2);
+
+  section('The SQL guard allows everyday reads');
+
+  eq(
+    'CASE ... END is allowed',
+    (await api('POST', `/api/sources/${sourceId}/query`, { sql: 'SELECT CASE WHEN 1 THEN 2 ELSE 3 END AS x' })).status,
+    200,
+  );
+  eq(
+    'replace() is allowed',
+    (await api('POST', `/api/sources/${sourceId}/query`, { sql: "SELECT replace(name,'a','b') AS n FROM people LIMIT 1" })).status,
+    200,
+  );
+  eq(
+    'a single trailing semicolon is allowed',
+    (await api('POST', `/api/sources/${sourceId}/query`, { sql: 'SELECT 1 AS n;' })).status,
+    200,
+  );
+  eq(
+    'a double semicolon is not',
+    (await api('POST', `/api/sources/${sourceId}/query`, { sql: 'SELECT 1 AS n;;' })).status,
+    400,
+  );
+  const capped = await api('POST', `/api/sources/${sourceId}/query`, { sql: 'SELECT * FROM orders' });
+  eq('a full scan is capped, not materialised', capped.body.rows.length, 500);
+  eq('and reports truncation', capped.body.truncated, true);
+  eq('with the count it actually returned', capped.body.total, 500);
+
+  section('Transport hardening');
+
+  const malformed = await fetch(`${BASE}/api/sources/%zz`);
+  eq('a malformed escape is a 400', malformed.status, 400);
+  eq('and the server survived it', (await api('GET', '/api/health')).status, 200);
+  eq('the static path is guarded too', (await fetch(`${BASE}/%zz`)).status, 400);
+  // fetch() refuses to set Host — it is a forbidden header name — so this one
+  // check has to go out over raw http.
+  const foreignHost = await new Promise((resolve) => {
+    const req = http.request(
+      {
+        host: '127.0.0.1',
+        port: Number(new URL(BASE).port),
+        path: '/api/health',
+        headers: { host: 'attacker.example' },
+      },
+      (res) => {
+        res.resume();
+        res.on('end', () => resolve(res.statusCode));
+      },
+    );
+    req.on('error', () => resolve(0));
+    req.end();
+  });
+  eq('a foreign Host header is refused', foreignHost, 403);
+
+  section('Spreadsheet header flag on the write path');
+
+  const boolPath = copyFixture('cities.csv');
+  const boolId = (await api('POST', '/api/sources', { path: boolPath })).body.added[0].id;
+  await api('PATCH', `/api/sources/${boolId}`, { editEnabled: true });
+
+  // Regression: a JSON boolean header was coerced to false, so the server
+  // recomputed the columns as column_1..n and rejected the insert.
+  const boolInsert = await api('POST', `/api/sources/${boolId}/objects/Sheet1/rows`, {
+    ops: [{ op: 'insert', values: { city: 'Bool Town', country: 'Boolia' } }],
+    header: true,
+  });
+  eq('insert accepts a JSON boolean header', boolInsert.status, 200);
+  const afterBool = await api('GET', `/api/sources/${boolId}/objects/Sheet1/rows?limit=50`);
+  check('and the row is present', afterBool.body.rows.some((r) => r[0] === 'Bool Town'));
+
+  const offSchema = await api('GET', `/api/sources/${boolId}/objects/Sheet1/schema?header=0`);
+  eq('header=0 renames the columns', offSchema.body.columns[0].name, 'column_1');
+  const offRows = await api('GET', `/api/sources/${boolId}/objects/Sheet1/rows?header=0&limit=3`);
+  eq('header=0 makes row 0 data', offRows.body.rows[0][0], 'city');
+  const offDelete = await api('POST', `/api/sources/${boolId}/objects/Sheet1/rows`, {
+    ops: [{ op: 'delete', rowKey: offRows.body.rowKeys[0] }],
+    header: 0,
+  });
+  eq('the first data row is deletable with header off', offDelete.status, 200);
+  const offAfter = await api('GET', `/api/sources/${boolId}/objects/Sheet1/rows?header=0&limit=3`);
+  check('and it is gone', offAfter.body.rows[0][0] !== 'city');
+
+  section('Spreadsheet write fidelity');
+
+  const tsvPath = path.join(SCRATCH, 'tabs.tsv');
+  fs.writeFileSync(tsvPath, 'a\tb\n1\t2\n3\t4\n', 'utf8');
+  const tsvAdded = await api('POST', '/api/sources', { path: tsvPath });
+  eq('.tsv opens', tsvAdded.status, 200);
+  const tsvId = tsvAdded.body.added[0].id;
+  const tsvRows = await api('GET', `/api/sources/${tsvId}/objects/Sheet1/rows`);
+  eq('.tsv splits into two columns', tsvRows.body.columns.length, 2);
+  eq('.tsv consumes its header', tsvRows.body.columns[0].name, 'a');
+  await api('PATCH', `/api/sources/${tsvId}`, { editEnabled: true });
+  await api('POST', `/api/sources/${tsvId}/objects/Sheet1/rows`, {
+    ops: [{ op: 'update', rowKey: tsvRows.body.rowKeys[0], columnIndex: 1, value: '9' }],
+  });
+  check('a rewritten .tsv keeps tabs', fs.readFileSync(tsvPath, 'utf8').includes('\t'));
+
+  const bomPath = copyFixture('cities.csv');
+  const bomId = (await api('POST', '/api/sources', { path: bomPath })).body.added[0].id;
+  await api('PATCH', `/api/sources/${bomId}`, { editEnabled: true });
+  const bomRows = await api('GET', `/api/sources/${bomId}/objects/Sheet1/rows?limit=1`);
+  await api('POST', `/api/sources/${bomId}/objects/Sheet1/rows`, {
+    ops: [{ op: 'update', rowKey: bomRows.body.rowKeys[0], columnIndex: 1, value: 'Edited' }],
+  });
+  const bomBytes = fs.readFileSync(bomPath);
+  check(
+    'a rewritten CSV gains no BOM',
+    !(bomBytes[0] === 0xef && bomBytes[1] === 0xbb && bomBytes[2] === 0xbf),
+    [...bomBytes.slice(0, 4)].join(','),
+  );
+
+  // The backup is the only safety net for a knowingly lossy rewrite, so it must
+  // still hold the original after several writes, not the previous save.
+  const pristine = fs.readFileSync(path.join(FIXTURES, 'inventory.xlsx'));
+  check(
+    'the backup still holds the pre-edit original after three writes',
+    fs.readFileSync(`${xlsxPath}.dblens-backup`).equals(pristine),
+  );
+
+  section('Sheet anchor and formula fidelity');
+
+  const anchorPath = path.join(SCRATCH, 'anchored.xlsx');
+  {
+    const workbook = XLSX.utils.book_new();
+    const ws = {
+      C2: { t: 's', v: 'SKU' },
+      D2: { t: 's', v: 'Qty' },
+      C3: { t: 's', v: 'A1' },
+      D3: { t: 'n', v: 5, f: '2+3' },
+      C4: { t: 's', v: 'B2' },
+      D4: { t: 'n', v: 7 },
+      '!ref': 'C2:D4',
+    };
+    XLSX.utils.book_append_sheet(workbook, ws, 'Block');
+    XLSX.writeFile(workbook, anchorPath, { bookType: 'xlsx' });
+  }
+
+  const anchorId = (await api('POST', '/api/sources', { path: anchorPath })).body.added[0].id;
+  const anchorRows = await api('GET', `/api/sources/${anchorId}/objects/Block/rows`);
+  eq('a non-A1 sheet reads its first column', anchorRows.body.columns[0].name, 'SKU');
+  eq('and reports physical row numbers', anchorRows.body.rowNumbers[0], 3);
+  await api('PATCH', `/api/sources/${anchorId}`, { editEnabled: true });
+  const anchorUpdate = await api('POST', `/api/sources/${anchorId}/objects/Block/rows`, {
+    ops: [{ op: 'update', rowKey: anchorRows.body.rowKeys[1], columnIndex: 1, value: 99 }],
+  });
+  eq('editing it succeeds', anchorUpdate.status, 200);
+
+  const rewritten = XLSX.readFile(anchorPath, { cellFormula: true });
+  const rewrittenWs = rewritten.Sheets.Block;
+  const rewrittenRange = XLSX.utils.decode_range(rewrittenWs['!ref']);
+  eq(
+    'the used range is not relocated to A1',
+    `${rewrittenRange.s.c},${rewrittenRange.s.r}`,
+    '2,1',
+  );
+  eq('the header cell stayed put', rewrittenWs.C2?.v, 'SKU');
+  eq('a formula on an untouched cell survives', rewrittenWs.D3?.f, '2+3');
+  eq('and the edit landed', rewrittenWs.D4?.v, 99);
+
+  section('Worker deadline recovery');
+
+  const engine = new Engine({
+    path: path.join(FIXTURES, 'crm.sqlite'),
+    kind: 'sqlite',
+    timeoutMs: 60_000,
+  });
+  let timedOut = false;
+  try {
+    await engine.call(
+      'query',
+      {
+        sql: 'WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x < 2000000) SELECT count(*) FROM c',
+      },
+      { timeoutMs: 100 },
+    );
+  } catch (err) {
+    timedOut = err.status === 504;
+  }
+  check('a slow query hits the deadline', timedOut);
+
+  // Regression: the dying worker's exit used to reject requests belonging to
+  // the replacement, so the first call after any timeout failed with a 500.
+  let recovered = null;
+  try {
+    recovered = (await engine.call('listObjects')).length;
+  } catch (err) {
+    recovered = `rejected: ${err.message}`;
+  }
+  check('the next request succeeds on the respawned engine', typeof recovered === 'number' && recovered > 0, String(recovered));
+  await engine.close();
+
   // ------------------------------------------------------------------ report
   console.log('');
   if (failures.length) {
@@ -473,7 +719,27 @@ async function main() {
   console.log(`scratch: ${SCRATCH}`);
 }
 
+/**
+ * Runs against an in-process server unless a base URL was given, so the suite
+ * is `node scripts/smoke.mjs` with no prerequisites. Everything it creates —
+ * scratch files, the state database, the listener — is torn down at the end.
+ */
+async function main() {
+  if (!BASE) {
+    app = createServer({ dataDir: path.join(SCRATCH, 'state') });
+    BASE = `http://127.0.0.1:${await listen(app.server, { port: 0 })}`;
+  }
+
+  try {
+    await body();
+  } finally {
+    if (app) await app.close();
+    fs.rmSync(SCRATCH, { recursive: true, force: true });
+  }
+}
+
 main().catch((err) => {
   console.error('\nsmoke run crashed:', err);
+  fs.rmSync(SCRATCH, { recursive: true, force: true });
   process.exitCode = 1;
 });

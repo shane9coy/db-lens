@@ -82,7 +82,7 @@ export function SchemaPanel({
               {source.editEnabled ? 'Edit mode on' : 'Read-only'}
             </span>
           </label>
-          {source.kind !== 'sqlite' ? (
+          {schema.hasHeader !== undefined ? (
             <label className="mt-2 flex cursor-pointer items-center gap-2">
               <Switch
                 checked={hasHeader}

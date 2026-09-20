@@ -1,13 +1,16 @@
 /**
- * Excel (.xlsx/.xlsm/.xls) and CSV adapter.
+ * Excel (.xlsx/.xlsm/.xls) and delimited text (.csv/.tsv/.txt) adapter.
  *
  * Each sheet is presented as a table so the UI keeps one mental model. The
- * sheet is held in memory as a grid of raw values; mutations edit the grid and
- * rewrite the whole workbook via an atomic temp-file rename. Cell styles,
- * formulas and column widths are NOT preserved on write — the schema response
- * reports `writeCaveat` so the UI can warn before enabling edit mode.
+ * sheet is held in memory as a grid of raw values, together with the anchor and
+ * the formulas of the original used range; mutations edit the grid and rewrite
+ * the workbook through a uniquely-named temp file and an atomic rename.
+ *
+ * A rewrite cannot carry everything. What is lost is listed in `WRITE_CAVEAT`
+ * and reported to the UI so the user is told before they switch edit mode on.
  */
 
+import { randomUUID } from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import XLSXModule from 'xlsx';
@@ -23,21 +26,24 @@ const TYPE_SAMPLE = 250;
 
 const BOOK_TYPE = {
   '.xlsx': 'xlsx',
-  '.xlsm': 'xlsx',
+  '.xlsm': 'xlsm',
   '.xls': 'biff8',
   '.csv': 'csv',
+  '.tsv': 'csv',
   '.txt': 'csv',
 };
 
+/** Delimited text: read and written with an explicit field separator. */
+const DELIMITED = { '.csv': ',', '.tsv': '\t', '.txt': '\t' };
+
 const WRITE_CAVEAT =
-  'Saving rewrites the sheet with SheetJS: cell values, dates and formulas-as-text survive, ' +
-  'but styling, conditional formatting, charts, column widths and images are dropped.';
+  'Saving rewrites the sheet with SheetJS. Values and dates survive; styling, conditional formatting, ' +
+  'charts, column widths and images are dropped, and formulas survive only while no row is inserted or deleted.';
 
 export class ExcelAdapter {
   /** Parsed workbook plus its per-sheet grids, dropped when the file changes. */
   #loaded = null;
   #mtime = null;
-  #backedUp = false;
 
   constructor(filePath) {
     const ext = path.extname(filePath).toLowerCase();
@@ -46,10 +52,11 @@ export class ExcelAdapter {
       err.status = 400;
       throw err;
     }
-    this.kind = ext === '.csv' || ext === '.txt' ? 'csv' : 'excel';
+    this.kind = ext in DELIMITED ? 'csv' : 'excel';
     this.path = filePath;
     this.extension = ext;
     this.bookType = BOOK_TYPE[ext];
+    this.fieldSeparator = DELIMITED[ext] ?? null;
   }
 
   // ------------------------------------------------------------------- loading
@@ -59,11 +66,22 @@ export class ExcelAdapter {
     const stamp = stat.mtimeMs;
     if (this.#loaded && this.#mtime === stamp) return this.#loaded;
 
-    const workbook = XLSX.readFile(this.path, { cellDates: true, cellFormula: true });
+    const readOptions = { cellDates: true, cellFormula: true, bookVBA: true };
+    if (this.fieldSeparator) readOptions.FS = this.fieldSeparator;
+
+    const workbook = XLSX.readFile(this.path, readOptions);
     const sheets = new Map();
 
     for (const name of workbook.SheetNames) {
-      sheets.set(name, { grid: sheetToGrid(workbook.Sheets[name]), dirty: false });
+      const { grid, formulas, origin } = readSheet(workbook.Sheets[name]);
+      sheets.set(name, {
+        grid,
+        formulas,
+        origin,
+        edited: new Set(),
+        structural: false,
+        dirty: false,
+      });
     }
 
     this.#loaded = { workbook, sheets };
@@ -190,42 +208,106 @@ export class ExcelAdapter {
     return key[1];
   }
 
+  /**
+   * Take the one-and-only backup.
+   *
+   * It is created exclusively and only when absent, so it keeps holding the
+   * pre-edit original however many times the file is written. Instance state
+   * cannot track this: a rename changes the inode, which makes SourceManager
+   * rebuild the adapter after every write.
+   */
+  #backupOnce() {
+    const backup = `${this.path}.dblens-backup`;
+    let existing = null;
+    try {
+      existing = fs.lstatSync(backup);
+    } catch {
+      existing = null;
+    }
+
+    if (existing) {
+      if (existing.isSymbolicLink()) {
+        const err = new Error(`Refusing to save: ${backup} is a symbolic link.`);
+        err.status = 400;
+        throw err;
+      }
+      return;
+    }
+    fs.copyFileSync(this.path, backup, fs.constants.COPYFILE_EXCL);
+  }
+
   #writeBack() {
     const loaded = this.#load();
     const workbook = loaded.workbook;
 
     for (const [name, sheet] of loaded.sheets) {
       if (!sheet.dirty) continue;
+
       const aoa = sheet.grid.map((row) =>
         row.map((value) => (value === undefined ? null : value)),
       );
-      const ws = XLSX.utils.aoa_to_sheet(aoa, { cellDates: true });
-      // aoa_to_sheet derives the range from the data; pin it to the grid so a
-      // trailing all-empty row is not silently trimmed away.
+      // Rebuild at the sheet's original anchor. aoa_to_sheet alone would move a
+      // range that does not start at A1, overwriting whatever lives above it.
+      const ws = XLSX.utils.aoa_to_sheet(aoa, { cellDates: true, origin: sheet.origin });
+
+      const width = Math.max(1, sheet.grid.reduce((max, row) => Math.max(max, row.length), 0));
       ws['!ref'] = XLSX.utils.encode_range({
-        s: { r: 0, c: 0 },
-        e: { r: Math.max(aoa.length - 1, 0), c: Math.max((aoa[0]?.length ?? 1) - 1, 0) },
+        s: sheet.origin,
+        e: {
+          r: sheet.origin.r + Math.max(aoa.length - 1, 0),
+          c: sheet.origin.c + width - 1,
+        },
       });
+
+      // A formula only still means what it meant if the rows did not move.
+      if (!sheet.structural) {
+        for (const [key, formula] of sheet.formulas) {
+          if (sheet.edited.has(key)) continue;
+          const [r, c] = key.split(':').map(Number);
+          const address = XLSX.utils.encode_cell({
+            r: sheet.origin.r + r,
+            c: sheet.origin.c + c,
+          });
+          const cell = ws[address];
+          if (cell) cell.f = formula;
+          else ws[address] = { t: 'n', f: formula };
+        }
+      }
+
       workbook.Sheets[name] = ws;
       sheet.dirty = false;
     }
 
-    // One backup per file per process, taken before the first mutation.
-    if (!this.#backedUp) {
+    this.#backupOnce();
+
+    const writeOptions = {
+      type: 'buffer',
+      bookType: this.bookType,
+      cellDates: true,
+      bookVBA: Boolean(workbook.vbaraw),
+    };
+    if (this.fieldSeparator) writeOptions.FS = this.fieldSeparator;
+
+    const written = XLSX.write(workbook, writeOptions);
+    const buffer = this.kind === 'csv' ? stripBom(written) : written;
+
+    // A fresh unique name plus `wx` means the temp path cannot be pre-planted
+    // as a symlink, and cannot silently overwrite anything if it somehow is.
+    const tmp = `${this.path}.dblens-tmp-${randomUUID()}`;
+    try {
+      fs.writeFileSync(tmp, buffer, { flag: 'wx' });
+      const stat = fs.statSync(this.path);
+      fs.renameSync(tmp, this.path);
+      fs.chmodSync(this.path, stat.mode);
+    } catch (err) {
       try {
-        fs.copyFileSync(this.path, `${this.path}.dblens-backup`);
+        fs.unlinkSync(tmp);
       } catch {
-        /* best effort only */
+        /* the temp file was never created */
       }
-      this.#backedUp = true;
+      throw err;
     }
 
-    const tmp = `${this.path}.dblens-tmp`;
-    XLSX.writeFile(workbook, tmp, { bookType: this.bookType, cellDates: true });
-
-    const stat = fs.statSync(this.path);
-    fs.renameSync(tmp, this.path);
-    fs.chmodSync(this.path, stat.mode);
     this.#mtime = fs.statSync(this.path).mtimeMs;
   }
 
@@ -270,8 +352,8 @@ export class ExcelAdapter {
 
   getRows(name, { limit = DEFAULT_LIMIT, offset = 0, sort = null, dir = 'asc', q = null, hasHeader = true } = {}) {
     const sheet = this.#sheet(name);
-    const size = Math.max(1, Math.min(Number(limit) || DEFAULT_LIMIT, MAX_LIMIT));
-    const skip = Math.max(0, Number(offset) || 0);
+    const size = Math.max(1, Math.min(Math.floor(Number(limit)) || DEFAULT_LIMIT, MAX_LIMIT));
+    const skip = Math.max(0, Math.floor(Number(offset)) || 0);
     const columns = this.#columns(sheet.grid, hasHeader);
 
     const filtered = this.#selectIndices(sheet, hasHeader, columns, q);
@@ -290,7 +372,9 @@ export class ExcelAdapter {
       rows,
       rowKeys: page.map((r) => JSON.stringify(['s', r])),
       rowKeyKind: 'row',
-      rowNumbers: page.map((r) => r + 1),
+      // Grid rows are relative to the used range, so report the physical sheet
+      // row the user would see as the spreadsheet's own row number.
+      rowNumbers: page.map((r) => r + sheet.origin.r + 1),
       total: ordered.length,
       limit: size,
       offset: skip,
@@ -304,73 +388,136 @@ export class ExcelAdapter {
     throw err;
   }
 
-  mutate(name, ops, { hasHeader = true } = {}) {
-    const sheet = this.#sheet(name);
-    const columns = this.#columns(sheet.grid, hasHeader);
-    const results = [];
+  /**
+   * Cheap reachability check for the import path: the header bytes catch a file
+   * whose extension lies about its contents, without parsing it.
+   */
+  probe() {
+    const head = Buffer.alloc(4);
+    const fd = fs.openSync(this.path, 'r');
+    let read;
+    try {
+      read = fs.readSync(fd, head, 0, 4, 0);
+    } finally {
+      fs.closeSync(fd);
+    }
 
-    for (const op of ops) {
-      if (op.op === 'update') {
-        const target =
-          columns.find((c) => c.colIndex === op.columnIndex) ??
-          columns.find((c) => c.name === op.column);
-        if (!target) {
-          const err = new Error(`Unknown column: ${op.column ?? op.columnIndex}`);
-          err.status = 400;
-          throw err;
-        }
-        const r = this.#rowIndex(op.rowKey);
-        if (r < 0 || r >= sheet.grid.length) {
-          const err = new Error('Row not found — it may have been changed or deleted elsewhere.');
-          err.status = 409;
-          throw err;
-        }
-        sheet.grid[r][target.colIndex] = normaliseInput(op.value);
-        sheet.dirty = true;
-        results.push({ op: 'update', changed: 1 });
-        continue;
-      }
-
-      if (op.op === 'delete') {
-        const r = this.#rowIndex(op.rowKey);
-        if (r <= 0 || r >= sheet.grid.length) {
-          const err = new Error('That row cannot be deleted.');
-          err.status = 409;
-          throw err;
-        }
-        sheet.grid.splice(r, 1);
-        sheet.dirty = true;
-        results.push({ op: 'delete', changed: 1 });
-        continue;
-      }
-
-      if (op.op === 'insert') {
-        const width = columns.length || 1;
-        const row = new Array(width).fill(null);
-        for (const [key, value] of Object.entries(op.values ?? {})) {
-          const target =
-            columns.find((c) => String(c.colIndex) === String(key)) ?? columns.find((c) => c.name === key);
-          if (!target) {
-            const err = new Error(`Unknown column: ${key}`);
-            err.status = 400;
-            throw err;
-          }
-          row[target.colIndex] = normaliseInput(value);
-        }
-        const at = op.rowKey ? this.#rowIndex(op.rowKey) : sheet.grid.length;
-        const insertAt = Math.max(hasHeader ? 1 : 0, Math.min(at, sheet.grid.length));
-        sheet.grid.splice(insertAt, 0, row);
-        sheet.dirty = true;
-        results.push({ op: 'insert', rowKey: JSON.stringify(['s', insertAt]) });
-        continue;
-      }
-
-      const err = new Error(`Unsupported operation: ${op.op}`);
+    if (read === 0) {
+      const err = new Error(`${path.basename(this.path)} is empty.`);
       err.status = 400;
       throw err;
     }
 
-    if (sheet.dirty) this.#writeBack();
+    const signature =
+      this.extension === '.xls'
+        ? Buffer.from([0xd0, 0xcf, 0x11, 0xe0])
+        : this.kind === 'excel'
+          ? Buffer.from([0x50, 0x4b, 0x03, 0x04])
+          : null;
+
+    if (signature && !head.equals(signature)) {
+      const err = new Error(`${path.basename(this.path)} is not a valid ${this.extension} file.`);
+      err.status = 400;
+      throw err;
+    }
+    return true;
+  }
+
+  /**
+   * Validate the whole batch before touching the grid.
+   *
+   * A batch that fails halfway must leave the sheet exactly as it was: the
+   * client is told the write failed, so any rows already changed in memory
+   * would silently reach disk on the next successful save. SQLite gets this
+   * from a transaction; here it is a plan-then-apply split.
+   */
+  mutate(name, ops, { hasHeader = true } = {}) {
+    const sheet = this.#sheet(name);
+    const columns = this.#columns(sheet.grid, hasHeader);
+    const firstDataRow = hasHeader ? 1 : 0;
+
+    const badRequest = (message) => {
+      const err = new Error(message);
+      err.status = 400;
+      return err;
+    };
+    const conflict = (message) => {
+      const err = new Error(message);
+      err.status = 409;
+      return err;
+    };
+
+    const plan = ops.map((op) => {
+      if (op.op === 'update') {
+        const target =
+          columns.find((c) => c.colIndex === op.columnIndex) ??
+          columns.find((c) => c.name === op.column);
+        if (!target) throw badRequest(`Unknown column: ${op.column ?? op.columnIndex}`);
+        const r = this.#rowIndex(op.rowKey);
+        if (r < 0 || r >= sheet.grid.length) {
+          throw conflict('Row not found — it may have been changed or deleted elsewhere.');
+        }
+        return { kind: 'update', r, target, value: op.value };
+      }
+
+      if (op.op === 'delete') {
+        const r = this.#rowIndex(op.rowKey);
+        // With the header toggle off, row 0 is data and must be deletable.
+        if (r < firstDataRow || r >= sheet.grid.length) {
+          throw conflict('That row cannot be deleted.');
+        }
+        return { kind: 'delete', r };
+      }
+
+      if (op.op === 'insert') {
+        const width = Math.max(1, columns.length);
+        const row = new Array(width).fill(null);
+        for (const [key, value] of Object.entries(op.values ?? {})) {
+          const target =
+            columns.find((c) => String(c.colIndex) === String(key)) ??
+            columns.find((c) => c.name === key);
+          if (!target) throw badRequest(`Unknown column: ${key}`);
+          row[target.colIndex] = normaliseInput(value);
+        }
+        const at = op.rowKey ? this.#rowIndex(op.rowKey) : sheet.grid.length;
+        return {
+          kind: 'insert',
+          row,
+          at: Math.max(firstDataRow, Math.min(at, sheet.grid.length)),
+        };
+      }
+
+      throw badRequest(`Unsupported operation: ${op.op}`);
+    });
+
+    // Apply, tracking how much earlier structural edits have shifted indices.
+    const results = [];
+    let delta = 0;
+    for (const step of plan) {
+      if (step.kind === 'update') {
+        sheet.grid[step.r + delta][step.target.colIndex] = normaliseInput(step.value);
+        sheet.edited.add(`${step.r + delta}:${step.target.colIndex}`);
+        results.push({ op: 'update', changed: 1 });
+        continue;
+      }
+      if (step.kind === 'delete') {
+        sheet.grid.splice(step.r + delta, 1);
+        delta -= 1;
+        sheet.structural = true;
+        results.push({ op: 'delete', changed: 1 });
+        continue;
+      }
+      const at = step.at + delta;
+      sheet.grid.splice(at, 0, step.row);
+      delta += 1;
+      sheet.structural = true;
+      results.push({ op: 'insert', rowKey: JSON.stringify(['s', at]) });
+    }
+
+    if (results.length) {
+      sheet.dirty = true;
+      this.#writeBack();
+    }
     return { applied: results.length, results };
   }
 
@@ -381,21 +528,37 @@ export class ExcelAdapter {
 
 // ------------------------------------------------------------------ utilities
 
-/** Read a worksheet into an array of rows of raw JS values. */
-function sheetToGrid(ws) {
-  if (!ws || !ws['!ref']) return [];
+/**
+ * Read a worksheet into a grid of rows of raw JS values, remembering where the
+ * used range starts and which cells hold formulas.
+ */
+function readSheet(ws) {
+  if (!ws || !ws['!ref']) return { grid: [], formulas: new Map(), origin: { r: 0, c: 0 } };
+
   const range = XLSX.utils.decode_range(ws['!ref']);
   const grid = [];
+  const formulas = new Map();
 
   for (let r = range.s.r; r <= range.e.r; r += 1) {
     const row = [];
     for (let c = range.s.c; c <= range.e.c; c += 1) {
       const cell = ws[XLSX.utils.encode_cell({ r, c })];
       row.push(cellValue(cell));
+      if (cell && typeof cell.f === 'string') {
+        formulas.set(`${r - range.s.r}:${c - range.s.c}`, cell.f);
+      }
     }
     grid.push(row);
   }
-  return grid;
+
+  return { grid, formulas, origin: { r: range.s.r, c: range.s.c } };
+}
+
+/** SheetJS writes delimited text with a UTF-8 BOM; the original may not have had one. */
+function stripBom(buffer) {
+  return buffer.length >= 3 && buffer[0] === 0xef && buffer[1] === 0xbb && buffer[2] === 0xbf
+    ? buffer.subarray(3)
+    : buffer;
 }
 
 function cellValue(cell) {

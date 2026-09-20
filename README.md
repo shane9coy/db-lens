@@ -98,14 +98,18 @@ read-only however the toggle is set.
   transaction, and a row that changed underneath you produces a conflict rather
   than a silent overwrite. Text is coerced to the column's declared affinity, so
   typing `38` into an `INTEGER` column stores a number.
-- **Excel and CSV** — the same operations, written back to the file through a
-  temp file and an atomic rename, with a one-time `<file>.dblens-backup` taken
-  beside it before the first write of the session.
+- **Excel, TSV and CSV** — the same operations, written back through a
+  uniquely-named temp file and an atomic rename, with a one-time
+  `<file>.dblens-backup` beside it holding the pre-edit original.
 
 Two honest limits, both surfaced in the UI before you write anything:
 
-1. Saving a workbook rewrites the sheet. Values, dates and formulas survive;
-   styling, charts, column widths and images do not.
+1. Saving a workbook rewrites the sheet. Values and dates survive; styling,
+   conditional formatting, charts, column widths and images do not. A formula
+   survives only while no row is inserted or deleted — a structural edit makes
+   its references meaningless, so formulas are dropped rather than left pointing
+   at the wrong cells. The sheet is rebuilt at its original anchor, so a used
+   range that does not start at A1 stays where it is.
 2. A view, or a table with neither a `rowid` nor a primary key, is read-only —
    there is no way to address one of its rows.
 
@@ -119,7 +123,16 @@ before it runs, and it executes on a connection opened read-only with
 a string literal or a comment is fine, because those are stripped first.
 
 Queries run on a worker thread with a deadline, so one pathological join cannot
-wedge the server; the worker is terminated and respawned on the next call.
+block the server's event loop: the request fails with a 504 and the worker is
+retired, with a fresh one starting on the next call. Note the honest limit —
+terminating a thread parked inside native SQLite cannot interrupt the statement
+itself, so CPU it has already started is not reclaimed. The console is the only
+place you can ask for arbitrary work, and the row cap is enforced while
+streaming rather than after the fact.
+
+The server answers only to loopback names (`localhost`, `127.0.0.1`, `::1`)
+unless you bind it elsewhere, which keeps a page on any other origin — and DNS
+rebinding — from reaching the API.
 
 ## Layout
 
@@ -157,12 +170,15 @@ Table for the column model and TanStack Virtual for rows.
 ```bash
 npm start                    # backend on :4321, serving the built UI
 npm run dev                  # Vite dev server on :5173, proxying /api to :4321
-npm run smoke                # 116 API checks against a server on :4399
+npm run smoke                # 164 API checks, starts its own server
 npm run fixtures             # regenerate the sample data
 ```
 
-`npm run smoke` copies the fixtures to a scratch directory before mutating
-anything, so your sample files are never touched.
+`npm run smoke` starts an in-process server on an ephemeral port with its own
+state directory, copies the fixtures to a scratch directory before mutating
+anything, and removes both when it finishes — so it touches neither your
+fixtures nor your source list. Passing a base URL runs it against a server you
+already have: `node scripts/smoke.mjs http://127.0.0.1:4321`.
 
 ## API
 
@@ -180,6 +196,7 @@ POST   /api/sources/:id/objects/:name/rows     { ops: [...] }
 POST   /api/sources/:id/query                  { sql, limit }
 POST   /api/scan               { path, depth }
 GET    /api/fs                 ?dir
+GET    /api/fs/home
 ```
 
 `rows` returns rows as arrays aligned to `columns` rather than objects — that
@@ -190,7 +207,31 @@ addressed by `rowid` or by a composite primary key.
 
 ## Not built yet
 
-- **Postgres.** The adapter interface is the seam for it; there is no
-  half-finished implementation sitting in the tree.
+- **Postgres.** The adapter interface is the seam for it, but the source model
+  is a filesystem path end to end (`exists`, `dev:ino` staleness tracking), so a
+  non-file target also means touching the registry layer and the client's
+  `SourceKind` union.
 - **A VS Code webview wrapper** around the same UI.
 - Saved views, and the optional ER graph tab.
+
+## Known limits
+
+- **A `COUNT(*)` per fetch.** The pager and the console both show an exact
+  total, which costs a full scan on every request — about 9 ms per million rows
+  unfiltered, and roughly 0.4 ms per thousand rows on the filtered path (the
+  search cannot use an index). It is the first thing that will hurt on a very
+  large table.
+- **One rewrite per spreadsheet edit.** Every committed cell re-saves the whole
+  workbook: ~36 ms on the 300-row sample, 3.7–5.1 s on a 100k-row sheet.
+  Coalescing edits would fix it, but that needs a durability answer first — a
+  worker retired on a deadline never gets to flush.
+- **No automated UI verification.** The API suite cannot see the grid, so
+  UI-only defects have shipped before. A browser spec asserting that hiding a
+  column leaves the remaining values aligned, and that an edit survives a
+  reload, is the cheapest real guard.
+- **`xlsx` 0.18.5** is the last release published to npm and carries advisories
+  for crafted files; the published fixes exist only on SheetJS's own CDN, so
+  upgrading means pointing the dependency at that tarball.
+- **A retired worker's in-flight statement keeps running.** Terminating the
+  thread cannot interrupt work already inside native SQLite, so CPU spent on a
+  timed-out query is not reclaimed.

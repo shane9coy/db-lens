@@ -55,52 +55,35 @@ export function isBinaryType(declaredType) {
   return columnAffinity(declaredType) === 'BLOB';
 }
 
-/** Coerce a JSON value from the client into something the SQLite driver accepts. */
+const INTEGER_LITERAL = /^[+-]?\d+$/;
+const DECIMAL_LITERAL = /^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/;
+
+/**
+ * Coerce a JSON value from the client into something the SQLite driver accepts.
+ *
+ * Exact integers go through `BigInt`. `Number()` silently rounds past 2^53, so
+ * a plain coercion here would corrupt a 64-bit id on the way *in* even though
+ * the reader goes to trouble to preserve it on the way out.
+ */
 export function coerceForAffinity(affinity, value) {
   if (value === null || value === undefined) return null;
   if (typeof value === 'boolean') return affinity === 'TEXT' ? String(value) : value ? 1 : 0;
   if (typeof value === 'number' || typeof value === 'bigint') {
     return affinity === 'TEXT' ? String(value) : value;
   }
-  if (typeof value === 'string') {
-    if (affinity === 'INTEGER' || affinity === 'NUMERIC' || affinity === 'REAL') {
-      const trimmed = value.trim();
-      if (trimmed === '') return value;
-      const n = Number(trimmed);
-      if (Number.isFinite(n) && /^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/.test(trimmed)) return n;
-    }
-    return value;
+  if (typeof value !== 'string' || affinity === 'TEXT' || affinity === 'BLOB') return value;
+
+  const trimmed = value.trim();
+  if (trimmed === '') return value;
+
+  if (INTEGER_LITERAL.test(trimmed)) {
+    if (affinity === 'REAL') return Number(trimmed);
+    const exact = BigInt(trimmed);
+    return exact >= -MAX_SAFE && exact <= MAX_SAFE ? Number(trimmed) : exact;
+  }
+  if (DECIMAL_LITERAL.test(trimmed)) {
+    const numeric = Number(trimmed);
+    if (Number.isFinite(numeric)) return numeric;
   }
   return value;
-}
-
-/**
- * Value to bind when addressing a row by key. `toJsonValue` widens oversized
- * integers to strings to protect precision; SQLite still needs to see them as
- * integers to match, and BigInt binds exactly at any magnitude.
- */
-export function bindableValue(affinity, value) {
-  if (typeof value === 'string' && /^-?\d+$/.test(value)) {
-    if (affinity === 'INTEGER' || affinity === 'NUMERIC') {
-      try {
-        return BigInt(value);
-      } catch {
-        return value;
-      }
-    }
-  }
-  return value;
-}
-
-/** Human-readable byte size. */
-export function formatBytes(n) {
-  if (!Number.isFinite(n)) return '—';
-  const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-  let i = 0;
-  let v = n;
-  while (v >= 1024 && i < units.length - 1) {
-    v /= 1024;
-    i += 1;
-  }
-  return `${i === 0 ? v : v.toFixed(1)} ${units[i]}`;
 }

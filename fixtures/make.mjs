@@ -81,6 +81,15 @@ db.exec(`
     PRIMARY KEY (order_id, line_no)
   ) WITHOUT ROWID;
 
+  -- A column named "rowid" shadows the implicit one, and there is no primary
+  -- key, so this table genuinely cannot be addressed row-by-row and must be
+  -- read-only. It is the only fixture that exercises that branch.
+  CREATE TABLE audit_log (
+    rowid   INTEGER,
+    message TEXT,
+    at      TEXT
+  );
+
   CREATE VIEW v_order_totals AS
     SELECT o.id            AS order_id,
            p.name          AS customer,
@@ -101,6 +110,7 @@ const insertLine = db.prepare(
   'INSERT INTO order_lines (order_id, line_no, sku, qty) VALUES (?, ?, ?, ?)',
 );
 const insertSetting = db.prepare('INSERT INTO settings (key, value) VALUES (?, ?)');
+const insertAudit = db.prepare('INSERT INTO audit_log (rowid, message, at) VALUES (?, ?, ?)');
 
 const PEOPLE = 5000;
 const ORDERS = 12000;
@@ -150,6 +160,10 @@ for (const [key, value] of [
   ['last_export', null],
 ]) {
   insertSetting.run(key, value);
+}
+
+for (let i = 1; i <= 12; i += 1) {
+  insertAudit.run(i, `audit entry ${i}`, `2026-0${(i % 9) + 1}-${String((i % 27) + 1).padStart(2, '0')}`);
 }
 db.exec('COMMIT');
 db.close();

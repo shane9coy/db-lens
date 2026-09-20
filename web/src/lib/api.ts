@@ -107,13 +107,6 @@ export interface DirectoryListing {
   files: Array<{ name: string; path: string; ext: string; size: number | null }>;
 }
 
-export interface ScanResult {
-  root: string;
-  files: Array<{ path: string; name: string; ext: string; size: number | null; depth: number }>;
-  truncated: boolean;
-  scanned: number;
-}
-
 export class ApiError extends Error {
   readonly status: number;
   constructor(message: string, status: number) {
@@ -174,8 +167,6 @@ export interface RowQuery {
 }
 
 export const api = {
-  health: () => request<{ ok: boolean; dataDir: string; uiBuilt: boolean }>('/api/health'),
-
   listSources: () => request<{ sources: Source[] }>('/api/sources'),
 
   addSource: (path: string) =>
@@ -227,9 +218,6 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ sql, limit }),
     }),
-
-  scan: (path: string, depth = 3) =>
-    request<ScanResult>('/api/scan', { method: 'POST', body: JSON.stringify({ path, depth }) }),
 
   browse: (dir?: string) =>
     request<DirectoryListing>(`/api/fs${dir ? query({ dir }) : ''}`),

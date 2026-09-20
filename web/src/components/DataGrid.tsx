@@ -69,6 +69,13 @@ function parseInput(text: string, column: Column): unknown {
     return trimmed;
   }
   if (/int|real|numeric|number|float|double|decimal/.test(type)) {
+    // Integers beyond 2^53 must stay strings: Number() would round them here,
+    // before the value even reaches the server, and the server takes strings
+    // through BigInt. Only send a number when it is exactly representable.
+    if (/^[+-]?\d+$/.test(trimmed)) {
+      const asNumber = Number(trimmed);
+      return Number.isSafeInteger(asNumber) ? asNumber : trimmed;
+    }
     const numeric = Number(trimmed.replace(/,/g, ''));
     if (Number.isFinite(numeric) && /^[+-]?[\d,]*\.?\d+(?:[eE][+-]?\d+)?$/.test(trimmed)) return numeric;
   }

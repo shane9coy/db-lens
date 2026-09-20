@@ -32,7 +32,18 @@ const PAGE_SIZE = 500;
 function readHash(): { sourceId: number | null; objectName: string | null } {
   const match = window.location.hash.match(/^#\/source\/(\d+)(?:\/(.+))?$/);
   if (!match) return { sourceId: null, objectName: null };
-  return { sourceId: Number(match[1]), objectName: match[2] ? decodeURIComponent(match[2]) : null };
+
+  // A URL is a normal way to arrive here (the CLI prints them), so a bad escape
+  // must degrade to "no object named" rather than abort startup.
+  let objectName: string | null = null;
+  if (match[2]) {
+    try {
+      objectName = decodeURIComponent(match[2]);
+    } catch {
+      objectName = null;
+    }
+  }
+  return { sourceId: Number(match[1]), objectName };
 }
 
 /** replaceState keeps the address bar in sync without firing `hashchange`. */
@@ -80,6 +91,28 @@ export default function App() {
     () => sources.find((source) => source.id === activeSourceId) ?? null,
     [sources, activeSourceId],
   );
+
+  /**
+   * The current question, in one place. The read effect, the write call and the
+   * grid's reset key all derive from this, so adding a query dimension cannot
+   * leave one of them behind — which is how the write path previously lost the
+   * header flag the read path was sending.
+   */
+  const query = useMemo(
+    () => ({
+      sourceId: activeSourceId,
+      object: activeObject,
+      sort: sort.column,
+      dir: sort.dir,
+      filter: appliedFilter,
+      offset,
+      hasHeader,
+    }),
+    [activeSourceId, activeObject, sort.column, sort.dir, appliedFilter, offset, hasHeader],
+  );
+
+  /** Identifies the question, not the answer: a mutation's refetch must not reset the view. */
+  const queryKey = useMemo(() => JSON.stringify(query), [query]);
 
   const refreshSources = useCallback(async () => {
     try {
@@ -170,13 +203,14 @@ export default function App() {
   }, [activeSourceId, objectsToken, requestedObject]);
 
   useEffect(() => {
-    if (activeSourceId === null || !activeObject) {
+    const { sourceId, object, hasHeader: header } = query;
+    if (sourceId === null || !object) {
       setSchema(null);
       return;
     }
     let cancelled = false;
     api
-      .schema(activeSourceId, activeObject, hasHeader)
+      .schema(sourceId, object, header)
       .then((next) => {
         if (!cancelled) setSchema(next);
       })
@@ -186,10 +220,11 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [activeSourceId, activeObject, refreshToken, hasHeader]);
+  }, [query, refreshToken]);
 
   useEffect(() => {
-    if (activeSourceId === null || !activeObject) {
+    const { sourceId, object, sort: sortColumn, dir, filter: q, offset: skip } = query;
+    if (sourceId === null || !object) {
       setPage(null);
       return;
     }
@@ -198,13 +233,13 @@ export default function App() {
     const started = performance.now();
 
     api
-      .rows(activeSourceId, activeObject, {
+      .rows(sourceId, object, {
         limit: PAGE_SIZE,
-        offset,
-        sort: sort.column,
-        dir: sort.dir,
-        q: appliedFilter,
-        hasHeader,
+        offset: skip,
+        sort: sortColumn,
+        dir,
+        q,
+        hasHeader: query.hasHeader,
       })
       .then((next) => {
         if (cancelled) return;
@@ -222,16 +257,7 @@ export default function App() {
     return () => {
       cancelled = true;
     };
-  }, [
-    activeSourceId,
-    activeObject,
-    sort.column,
-    sort.dir,
-    appliedFilter,
-    offset,
-    refreshToken,
-    hasHeader,
-  ]);
+  }, [query, refreshToken]);
 
   // Typing in the filter box should not fire a query per keystroke.
   useEffect(() => {
@@ -321,12 +347,12 @@ export default function App() {
 
   const mutate = useCallback(
     async (ops: Mutation[]) => {
-      if (activeSourceId === null || !activeObject) return;
-      await api.mutate(activeSourceId, activeObject, ops);
+      if (query.sourceId === null || !query.object) return;
+      await api.mutate(query.sourceId, query.object, ops, query.hasHeader);
       setRefreshToken((token) => token + 1);
       setObjectsToken((token) => token + 1);
     },
-    [activeSourceId, activeObject],
+    [query],
   );
 
   const toggleEditFor = useCallback(
@@ -370,21 +396,6 @@ export default function App() {
     if (!page || detailRow === null) return '';
     return String(page.rowNumbers?.[detailRow] ?? offset + detailRow + 1);
   }, [page, detailRow, offset]);
-
-  /**
-   * Identifies the current *question*, not the current answer. Mutations bump
-   * `refreshToken` and refetch, but the grid must keep its scroll position and
-   * cursor across those; a new filter, sort, page or table must reset both.
-   */
-  const queryKey = [
-    activeSourceId ?? '',
-    activeObject ?? '',
-    sort.column ?? '',
-    sort.dir,
-    appliedFilter,
-    offset,
-    hasHeader ? 1 : 0,
-  ].join('|');
 
   return (
     <div className="flex h-full flex-col">
@@ -496,7 +507,12 @@ export default function App() {
                 filter={filter}
                 offset={offset}
                 queryKey={queryKey}
-                onSortChange={(column, dir) => setSort({ column, dir })}
+                onSortChange={(column, dir) => {
+                  setSort({ column, dir });
+                  // Rows are addressed by ordering, so page N of a new ordering
+                  // holds unrelated records. Filtering already does this.
+                  setOffset(0);
+                }}
                 onFilterChange={setFilter}
                 onMutate={mutate}
                 onOpenRow={setDetailRow}
@@ -585,7 +601,14 @@ export default function App() {
           rowLabel={detailLabel}
           onDelete={async () => {
             const rowKey = page.rowKeys?.[detailRow];
-            if (rowKey) await mutate([{ op: 'delete', rowKey }]);
+            if (!rowKey) return;
+            try {
+              await mutate([{ op: 'delete', rowKey }]);
+            } catch (err) {
+              setError(err instanceof Error ? err.message : 'Delete failed');
+              // Rethrow so the dialog stays open instead of implying success.
+              throw err;
+            }
           }}
         />
       ) : null}

@@ -95,9 +95,27 @@ function compile(pattern) {
   return { regex: new RegExp(`^${source}/?$`), names };
 }
 
+/**
+ * Coerce a flag that arrives either as a query string (`?header=1`) or as a
+ * JSON body field (`{ header: true }`). Both transports feed this, so it has to
+ * understand real booleans as well as their string spellings.
+ */
 function boolParam(value, fallback) {
   if (value === null || value === undefined || value === '') return fallback;
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') return value !== 0;
   return value === '1' || value === 'true';
+}
+
+/** Percent-decoding a hostile path throws; that must be a 400, not a crash. */
+function decodeParam(value) {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    const err = new Error('Malformed percent-encoding in the request path.');
+    err.status = 400;
+    throw err;
+  }
 }
 
 function rowOptions(query) {
@@ -111,9 +129,25 @@ function rowOptions(query) {
   };
 }
 
-export function createServer({ dataDir, timeoutMs } = {}) {
+export function createServer({ dataDir, timeoutMs, localOnly = true } = {}) {
   const resolvedData = dataDir ?? process.env.DB_LENS_DATA ?? path.join(ROOT, 'data');
   fs.mkdirSync(resolvedData, { recursive: true });
+
+  /**
+   * Bound to loopback, this server must answer only to loopback names. Without
+   * this check a page on any origin can reach 127.0.0.1, and DNS rebinding
+   * makes it same-origin — which would turn the API into an unauthenticated
+   * reader of every file the user can read.
+   */
+  function hostAllowed(hostHeader) {
+    if (!localOnly) return true;
+    if (!hostHeader) return false;
+    const hostname = hostHeader
+      .replace(/:\d+$/, '')
+      .replace(/^\[|\]$/g, '')
+      .toLowerCase();
+    return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1';
+  }
 
   const registry = new Registry(path.join(resolvedData, 'db-lens.sqlite'));
   const manager = new SourceManager({ registry, timeoutMs });
@@ -281,15 +315,20 @@ export function createServer({ dataDir, timeoutMs } = {}) {
     fs.createReadStream(target).pipe(res);
   }
 
-  const server = http.createServer(async (req, res) => {
+  async function handle(req, res) {
     const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
+
+    if (!hostAllowed(req.headers.host)) {
+      sendJson(res, 403, { error: 'Refused: unexpected Host header.' });
+      return;
+    }
 
     if (!url.pathname.startsWith('/api/')) {
       if (req.method !== 'GET' && req.method !== 'HEAD') {
         sendJson(res, 405, { error: 'Method not allowed' });
         return;
       }
-      serveStatic(req, res, decodeURIComponent(url.pathname));
+      serveStatic(req, res, decodeParam(url.pathname));
       return;
     }
 
@@ -302,16 +341,24 @@ export function createServer({ dataDir, timeoutMs } = {}) {
     const values = match.regex.exec(url.pathname).slice(1);
     const params = {};
     match.names.forEach((name, i) => {
-      params[name] = decodeURIComponent(values[i]);
+      params[name] = decodeParam(values[i]);
     });
 
-    try {
-      const body = await readBody(req);
-      const result = await match.handler({ req, res, params, query: url.searchParams, body, manager, registry });
-      sendJson(res, 200, result ?? { ok: true });
-    } catch (err) {
+    const body = await readBody(req);
+    const result = await match.handler({ req, res, params, query: url.searchParams, body, manager, registry });
+    sendJson(res, 200, result ?? { ok: true });
+  }
+
+  // An async listener that rejects is fatal to the process on Node 26, so every
+  // failure has to be caught here rather than only around the route handler.
+  const server = http.createServer((req, res) => {
+    handle(req, res).catch((err) => {
+      if (res.headersSent) {
+        res.destroy();
+        return;
+      }
       sendError(res, err);
-    }
+    });
   });
 
   async function close() {
@@ -341,7 +388,9 @@ export function listen(server, { port = 4321, host = '127.0.0.1', attempts = 20 
       });
       server.listen(candidate, host, () => {
         server.removeAllListeners('error');
-        resolve(candidate);
+        // Report the port actually bound, so `port: 0` (ephemeral) works.
+        const address = server.address();
+        resolve(typeof address === 'object' && address ? address.port : candidate);
       });
     };
 

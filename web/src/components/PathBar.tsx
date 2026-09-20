@@ -25,6 +25,7 @@ export function PathBar({
 }) {
   const [value, setValue] = useState('');
   const [listing, setListing] = useState<DirectoryListing | null>(null);
+  const [listingError, setListingError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -40,11 +41,15 @@ export function PathBar({
     return () => clearTimeout(timer);
   }, [copied]);
 
+  // A directory that vanished or is unreadable should say so rather than
+  // render as an empty list.
   const load = useCallback(async (dir?: string) => {
     try {
       setListing(await api.browse(dir));
-    } catch {
+      setListingError(null);
+    } catch (err) {
       setListing(null);
+      setListingError(err instanceof Error ? err.message : 'Could not read that directory');
     }
   }, []);
 
@@ -111,7 +116,14 @@ export function PathBar({
                   type="button"
                   className="rounded p-1 hover:bg-accent"
                   title="Home"
-                  onClick={() => void load()}
+                  onClick={async () => {
+                    try {
+                      const { home } = await api.home();
+                      await load(home);
+                    } catch {
+                      setListingError('Could not resolve the home directory');
+                    }
+                  }}
                 >
                   <Home className="size-3" />
                 </button>
@@ -161,6 +173,12 @@ export function PathBar({
                     </span>
                   </button>
                 ))}
+
+                {listingError ? (
+                  <p className="px-2 py-3 text-center font-mono text-[10px] break-words text-destructive">
+                    {listingError}
+                  </p>
+                ) : null}
 
                 {listing && !listing.directories.length && !listing.files.length ? (
                   <p className="px-2 py-3 text-center text-[11px] text-muted-foreground">

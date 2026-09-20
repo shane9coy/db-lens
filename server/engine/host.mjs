@@ -72,13 +72,19 @@ export class Engine {
       }
     });
 
+    // These must not fire for a worker that has already been replaced. After a
+    // deadline the host terminates us and spawns a successor; the dying thread's
+    // exit lands much later (terminate cannot interrupt native work) and would
+    // otherwise reject requests already posted to the healthy replacement.
     worker.on('error', (err) => {
-      this.#failAll(new EngineError(`Engine crashed: ${err.message}`));
+      if (this.#worker !== worker) return;
       this.#worker = null;
+      this.#failAll(new EngineError(`Engine crashed: ${err.message}`));
     });
 
     worker.on('exit', () => {
-      if (this.#worker === worker) this.#worker = null;
+      if (this.#worker !== worker) return;
+      this.#worker = null;
       this.#failAll(new EngineError('Engine stopped before the request finished.'));
     });
 

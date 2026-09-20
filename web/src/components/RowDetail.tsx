@@ -121,8 +121,13 @@ export function RowDetail({
               size="sm"
               className="mr-auto"
               onClick={async () => {
-                await onDelete();
-                onOpenChange(false);
+                try {
+                  await onDelete();
+                  onOpenChange(false);
+                } catch {
+                  // The parent already surfaced the reason. Staying open keeps
+                  // the row on screen rather than implying it was removed.
+                }
               }}
             >
               <Trash2 />

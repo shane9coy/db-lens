@@ -25,7 +25,13 @@ function engine() {
 }
 
 const HANDLERS = {
-  ping: () => ({ path: workerData.path, kind: workerData.kind }),
+  ping: () => {
+    // Constructing the adapter is what validates the file. Without this the
+    // import path registers unopenable files as healthy and every entry pays a
+    // worker spawn for no check at all.
+    engine().probe();
+    return { path: workerData.path, kind: workerData.kind };
+  },
   listObjects: () => engine().listObjects(),
   getSchema: (p) => engine().getSchema(p.name, p.options ?? {}),
   getRows: (p) => engine().getRows(p.name, p.options ?? {}),

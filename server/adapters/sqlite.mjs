@@ -9,7 +9,6 @@
 
 import { DatabaseSync } from 'node:sqlite';
 import {
-  bindableValue,
   coerceForAffinity,
   columnAffinity,
   isBinaryType,
@@ -96,8 +95,12 @@ export class SqliteAdapter {
       .filter((r) => r.type === 'table' || r.type === 'view');
   }
 
-  #describe(name) {
-    const entry = this.#tableList().find((r) => r.name === name);
+  /**
+   * `known` avoids re-running `PRAGMA table_list` for every table in a schema:
+   * callers that already walked the list pass the entry they matched.
+   */
+  #describe(name, known = null) {
+    const entry = known ?? this.#tableList().find((r) => r.name === name);
     if (!entry) {
       const err = new Error(`No such table or view: ${name}`);
       err.status = 404;
@@ -146,7 +149,7 @@ export class SqliteAdapter {
   #whereClause(desc, rowKey) {
     const key = this.#decodeKey(rowKey);
     if (desc.rowIdentity === 'rowid' && key[0] === 'r') {
-      return { sql: 'rowid = ?', params: [bindableValue('INTEGER', key[1])] };
+      return { sql: 'rowid = ?', params: [coerceForAffinity('INTEGER', key[1])] };
     }
     if (desc.rowIdentity === 'pk' && key[0] === 'pk') {
       const values = key[1];
@@ -160,7 +163,7 @@ export class SqliteAdapter {
       );
       return {
         sql: desc.pkColumns.map((c) => `${quoteIdent(c)} IS ?`).join(' AND '),
-        params: values.map((v, i) => bindableValue(affinities[i], v)),
+        params: values.map((v, i) => coerceForAffinity(affinities[i], v)),
       };
     }
     const err = new Error('Row key does not match this table.');
@@ -172,7 +175,7 @@ export class SqliteAdapter {
 
   listObjects() {
     return this.#tableList().map((entry) => {
-      const desc = this.#describe(entry.name);
+      const desc = this.#describe(entry.name, entry);
       let rowCount = null;
       try {
         rowCount = this.#metaOne(`SELECT COUNT(*) AS n FROM ${quoteIdent(entry.name)}`)?.n ?? null;
@@ -244,8 +247,8 @@ export class SqliteAdapter {
 
   getRows(name, { limit = DEFAULT_LIMIT, offset = 0, sort = null, dir = 'asc', q = null } = {}) {
     const desc = this.#describe(name);
-    const size = Math.max(1, Math.min(Number(limit) || DEFAULT_LIMIT, MAX_LIMIT));
-    const skip = Math.max(0, Number(offset) || 0);
+    const size = Math.max(1, Math.min(Math.floor(Number(limit)) || DEFAULT_LIMIT, MAX_LIMIT));
+    const skip = Math.max(0, Math.floor(Number(offset)) || 0);
 
     const names = desc.columns.map((c) => c.name);
     const useRowid = desc.rowIdentity === 'rowid';
@@ -331,12 +334,23 @@ export class SqliteAdapter {
   }
 
   query(sql, { limit = DEFAULT_LIMIT } = {}) {
-    const size = Math.max(1, Math.min(Number(limit) || DEFAULT_LIMIT, MAX_LIMIT));
+    const size = Math.max(1, Math.min(Math.floor(Number(limit)) || DEFAULT_LIMIT, MAX_LIMIT));
     const stmt = this.reader.prepare(sql);
     stmt.setReadBigInts(true);
     const meta = stmt.columns();
-    const raw = stmt.all();
-    const rows = raw.slice(0, size).map((record) => meta.map((m) => toJsonValue(record[m.name])));
+
+    // Stream and stop at the cap. `stmt.all()` would materialise the entire
+    // result set first — a plain `SELECT *` on a million-row table costs ~600 MB
+    // inside the worker before this slice could throw it away.
+    const rows = [];
+    let truncated = false;
+    for (const record of stmt.iterate()) {
+      if (rows.length >= size) {
+        truncated = true;
+        break;
+      }
+      rows.push(meta.map((m) => toJsonValue(record[m.name])));
+    }
 
     return {
       columns: meta.map((m) => ({
@@ -350,10 +364,10 @@ export class SqliteAdapter {
       rows,
       rowKeys: null,
       rowKeyKind: 'none',
-      total: raw.length,
+      total: rows.length,
       limit: size,
       offset: 0,
-      truncated: raw.length > size,
+      truncated,
     };
   }
 
@@ -461,6 +475,16 @@ export class SqliteAdapter {
     }
 
     return { applied: results.length, results };
+  }
+
+  /**
+   * Cheap reachability check. Opening the handle is not enough: a file that is
+   * not a database only fails on the first statement, so the import path would
+   * otherwise register broken files as healthy.
+   */
+  probe() {
+    this.reader.prepare('PRAGMA schema_version').get();
+    return true;
   }
 
   close() {

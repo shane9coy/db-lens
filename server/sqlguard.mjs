@@ -20,11 +20,13 @@ export class SqlGuardError extends Error {
 const FORBIDDEN = new RegExp(
   String.raw`\b(` +
     [
-      // statements that mutate schema or data
-      'insert', 'update', 'delete', 'replace', 'upsert', 'merge', 'truncate',
+      // statements that mutate schema or data. `replace()` the scalar function
+      // and `END` closing a CASE are deliberately absent: neither can start a
+      // statement, so the head check already excludes the write forms.
+      'insert', 'update', 'delete', 'upsert', 'merge', 'truncate',
       'drop', 'alter', 'create', 'rename',
       // transaction / session control
-      'begin', 'commit', 'rollback', 'savepoint', 'release', 'end',
+      'begin', 'commit', 'rollback', 'savepoint', 'release',
       // pragmas and maintenance
       'pragma', 'vacuum', 'reindex', 'analyze', 'writable_schema',
       // attachment and extension loading
@@ -123,21 +125,22 @@ export function maskSql(sql) {
  * semicolon removed.
  */
 export function assertSelectOnly(sql) {
-  if (typeof sql !== 'string' || sql.trim() === '') {
+  if (typeof sql !== 'string') {
     throw new SqlGuardError('SQL is required.');
   }
 
-  const masked = maskSql(sql);
+  // One trailing semicolon is a normal way to end a statement; a second one, or
+  // anything after it, is a second statement.
+  const body = sql.trim().replace(/;\s*$/, '');
+  if (body === '') throw new SqlGuardError('SQL is required.');
+
+  const masked = maskSql(body);
 
   if (/;/.test(masked)) {
     throw new SqlGuardError('Only one statement per query is allowed.');
   }
 
-  const body = sql.trim().replace(/;\s*$/, '').trim();
-  if (body === '') throw new SqlGuardError('SQL is required.');
-
-  const head = masked.trim();
-  if (!/^(select|with|values|explain)\b/i.test(head)) {
+  if (!/^(select|with|values|explain)\b/i.test(masked.trim())) {
     throw new SqlGuardError('Only SELECT queries are allowed.');
   }
 

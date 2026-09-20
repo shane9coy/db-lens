@@ -66,8 +66,8 @@ export function SqlConsole({
         ) : null}
         {result ? (
           <span className="font-mono text-[10px] text-muted-foreground">
-            {result.total} row{result.total === 1 ? '' : 's'}
-            {result.truncated ? ` · first ${result.limit} shown` : ''}
+            showing {result.total}
+            {result.truncated ? '+' : ''} row{result.total === 1 && !result.truncated ? '' : 's'}
           </span>
         ) : null}
 

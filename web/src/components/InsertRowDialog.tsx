@@ -126,9 +126,9 @@ export function InsertRowDialog({
                 onChange={(event) =>
                   setValues((prev) => ({ ...prev, [column.name]: event.target.value }))
                 }
-                disabled={column.binary}
+                disabled={column.binary || column.readonly}
                 placeholder={
-                  column.binary
+                  column.binary || column.readonly
                     ? 'binary — not editable here'
                     : column.default != null
                       ? `default ${String(column.default)}`

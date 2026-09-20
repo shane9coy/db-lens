@@ -43,6 +43,7 @@ const DATE_OID = 1082;
 const TIME_OID = 1083;
 const TIMESTAMP_OID = 1114;
 const TIMETZ_OID = 1266;
+const INTERVAL_OID = 1186;
 
 /**
  * node-postgres hands back int8 and numeric as strings, which is the right
@@ -71,9 +72,10 @@ types.setTypeParser(NUMERIC_OID, parseNumeric);
 // A calendar date has no time and no zone. The default parser turns it into a
 // Date at local midnight, which renders as a zoned timestamp and can even land
 // on the wrong day; keep the stored text instead, as the SQLite adapter does.
-// `timestamptz` keeps the default (an absolute instant), because there the
-// offset carries meaning.
-for (const oid of [DATE_OID, TIME_OID, TIMESTAMP_OID, TIMETZ_OID]) {
+// An interval parses into a `{days, hours, …}` object that would render as raw
+// JSON, so it keeps its text too. `timestamptz` keeps the default (an absolute
+// instant), because there the offset carries meaning.
+for (const oid of [DATE_OID, TIME_OID, TIMESTAMP_OID, TIMETZ_OID, INTERVAL_OID]) {
   types.setTypeParser(oid, (text) => text);
 }
 
@@ -295,6 +297,10 @@ export class PostgresAdapter {
         nullable: row.nullable,
         pk: pkColumns.includes(row.name),
         binary: isBinaryType(row.base_type),
+        // Postgres names an array type with a leading underscore. Arrays arrive
+        // parsed, so the grid would render JSON while the server expects the
+        // `{a,b}` literal — readable, but not safely writable.
+        readonly: String(row.base_type ?? '').startsWith('_'),
         default: toJsonValue(row.default_value),
       })),
       indexes: indexes.rows.map((row) => ({
@@ -402,6 +408,7 @@ export class PostgresAdapter {
       nullable: column.nullable,
       pk: column.pk,
       binary: column.binary,
+      readonly: column.readonly,
     }));
 
     const where = [];
@@ -580,6 +587,9 @@ export class PostgresAdapter {
         if (!column) throw badRequest(`Unknown column: ${op.column}`);
         if (column.binary) {
           throw badRequest(`Column "${column.name}" holds binary data and cannot be edited here.`);
+        }
+        if (column.readonly) {
+          throw badRequest(`Column "${column.name}" is an array and cannot be edited here.`);
         }
         return { kind: 'update', column, where: whereFor(op.rowKey, 1), value: op.value };
       }

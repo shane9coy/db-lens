@@ -50,8 +50,14 @@ export function columnAffinity(declaredType) {
   return 'NUMERIC';
 }
 
-/** True when the declared type should be treated as binary for editing purposes. */
+/**
+ * True when the declared type should be treated as binary for editing purposes.
+ * `bytea` is Postgres's spelling and has no BLOB in it, so it is named
+ * explicitly — otherwise the grid would offer an editor for a column whose
+ * value is base64 text that can never be written back.
+ */
 export function isBinaryType(declaredType) {
+  if (String(declaredType ?? '').toUpperCase() === 'BYTEA') return true;
   return columnAffinity(declaredType) === 'BLOB';
 }
 

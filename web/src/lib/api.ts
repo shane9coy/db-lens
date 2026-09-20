@@ -37,6 +37,11 @@ export interface Column {
   nullable: boolean;
   pk?: boolean;
   binary: boolean;
+  /**
+   * Holds a value this editor cannot round-trip — a Postgres array, whose text
+   * form is not what the grid would send back. Shown, never written.
+   */
+  readonly?: boolean;
   /** Spreadsheets only: the sheet column this maps to, for write-back. */
   colIndex?: number;
   /** Spreadsheets only: the original header text, before de-duplication. */

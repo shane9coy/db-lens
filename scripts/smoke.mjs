@@ -873,6 +873,79 @@ async function body() {
     const restored = await api('GET', `/api/sources/${pgId}/objects/${encodeURIComponent('public.settings')}/rows`);
     eq('the fixture is left as it was found', restored.body.total, 5);
 
+    // A second schema, and the same table name in two of them.
+    check('objects from another schema are listed', pgNames.includes('analytics.events'), JSON.stringify(pgNames));
+    check('and the same name in two schemas stays distinct', pgNames.filter((n) => n.endsWith('.events')).length === 2);
+    const analytics = await api('GET', `/api/sources/${pgId}/objects/${encodeURIComponent('analytics.events')}/rows?limit=2`);
+    eq('the other schema resolves', analytics.body.total, 40);
+    const publicEvents = await api('GET', `/api/sources/${pgId}/objects/${encodeURIComponent('public.events')}/rows?limit=2`);
+    eq('and so does public', publicEvents.body.total, 5);
+
+    // Types: what renders, and what is refused.
+    const odd = await api('GET', `/api/sources/${pgId}/objects/${encodeURIComponent('public.odd_types')}/rows?limit=2`);
+    const oddAt = (name) => odd.body.columns.findIndex((c) => c.name === name);
+    eq('bytea is flagged binary', odd.body.columns[oddAt('payload')].binary, true);
+    eq('an array is flagged read-only', odd.body.columns[oddAt('tags')].readonly, true);
+    check('bytea renders as base64', /^[A-Za-z0-9+/=]+$/.test(String(odd.body.rows[0][oddAt('payload')])), String(odd.body.rows[0][oddAt('payload')]));
+    eq('an interval keeps its text', odd.body.rows[0][oddAt('span')], '1 day 02:03:04');
+    eq(
+      'a numeric past 15 digits keeps every digit',
+      odd.body.rows[0][oddAt('amount')],
+      '12345678901234567890.1234567890',
+    );
+    eq('a jsonb column round-trips', odd.body.rows[0][oddAt('doc')].a, 1);
+    check('a NULL bytea is null, not empty', odd.body.rows[1][oddAt('payload')] === null);
+
+    const oddKeys = odd.body.rowKeys;
+    const binaryWrite = await api('POST', `/api/sources/${pgId}/objects/${encodeURIComponent('public.odd_types')}/rows`, {
+      ops: [{ op: 'update', rowKey: oddKeys[0], column: 'payload', value: 'x' }],
+    });
+    eq('a bytea column refuses a write', binaryWrite.status, 400);
+    const arrayWrite = await api('POST', `/api/sources/${pgId}/objects/${encodeURIComponent('public.odd_types')}/rows`, {
+      ops: [{ op: 'update', rowKey: oddKeys[0], column: 'tags', value: '["p"]' }],
+    });
+    eq('an array column refuses a write', arrayWrite.status, 400);
+    const jsonWrite = await api('POST', `/api/sources/${pgId}/objects/${encodeURIComponent('public.odd_types')}/rows`, {
+      ops: [{ op: 'update', rowKey: oddKeys[0], column: 'doc', value: '{"a":9}' }],
+    });
+    eq('jsonb is still writable', jsonWrite.status, 200);
+    const afterJson = await api('GET', `/api/sources/${pgId}/objects/${encodeURIComponent('public.odd_types')}/rows?limit=1`);
+    eq('and the new document is stored', afterJson.body.rows[0][oddAt('doc')].a, 9);
+    await api('POST', `/api/sources/${pgId}/objects/${encodeURIComponent('public.odd_types')}/rows`, {
+      ops: [{ op: 'update', rowKey: oddKeys[0], column: 'doc', value: '{"a":1,"b":[2,3]}' }],
+    });
+
+    // Composite key binding.
+    const edge = await api('GET', `/api/sources/${pgId}/objects/${encodeURIComponent('public.edge_keys')}/rows?limit=5`);
+    eq('a composite key is carried whole', JSON.parse(edge.body.rowKeys[1])[1].length, 2);
+    const edgeWrite = await api('POST', `/api/sources/${pgId}/objects/${encodeURIComponent('public.edge_keys')}/rows`, {
+      ops: [{ op: 'update', rowKey: edge.body.rowKeys[1], column: 'v', value: 'changed' }],
+    });
+    eq('and addresses exactly one row', edgeWrite.body.results[0].changed, 1);
+    const edgeAfter = await api('GET', `/api/sources/${pgId}/objects/${encodeURIComponent('public.edge_keys')}/rows?limit=5`);
+    eq('updating through it hits the right row', edgeAfter.body.rows.map((r) => r[2]), ['first', 'changed']);
+    await api('POST', `/api/sources/${pgId}/objects/${encodeURIComponent('public.edge_keys')}/rows`, {
+      ops: [{ op: 'update', rowKey: edge.body.rowKeys[1], column: 'v', value: 'second' }],
+    });
+
+    // An identifier that needs quoting on both sides.
+    const hostileName = pgNames.find((n) => n.includes('quoted'));
+    check('a quoted table name is listed', Boolean(hostileName), JSON.stringify(pgNames));
+    if (hostileName) {
+      const hostile = await api('GET', `/api/sources/${pgId}/objects/${encodeURIComponent(hostileName)}/rows`);
+      eq('its columns are read', hostile.body.columns.map((c) => c.name), ['id', 'col "x"']);
+      eq('and its value', hostile.body.rows[0][1], 'quoted-value');
+      const hostileWrite = await api('POST', `/api/sources/${pgId}/objects/${encodeURIComponent(hostileName)}/rows`, {
+        ops: [{ op: 'update', rowKey: hostile.body.rowKeys[0], column: 'col "x"', value: 'edited' }],
+      });
+      eq('and it can be written through', hostileWrite.status, 200);
+      const hostileAfter = await api('GET', `/api/sources/${pgId}/objects/${encodeURIComponent(hostileName)}/rows`);
+      eq('with no escaping damage', hostileAfter.body.rows[0][1], 'edited');
+      await api('POST', `/api/sources/${pgId}/objects/${encodeURIComponent(hostileName)}/rows`, {
+        ops: [{ op: 'update', rowKey: hostile.body.rowKeys[0], column: 'col "x"', value: 'quoted-value' }],
+      });
+    }
+
     const stalePg = await api('POST', `/api/sources/${pgId}/objects/${encodeURIComponent('public.settings')}/rows`, {
       ops: [{ op: 'delete', rowKey: '["pk",["no-such-key"]]' }],
     });

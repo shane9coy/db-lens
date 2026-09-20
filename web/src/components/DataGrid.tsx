@@ -428,7 +428,7 @@ export function DataGrid({
         case 'Enter': {
           event.preventDefault();
           const column = visible[focus.column]?.columnDef.meta?.column;
-          if (!editable || !column || column.binary) return;
+          if (!editable || !column || column.binary || column.readonly) return;
           const raw = page.rows[focus.row]?.[column.colIndex ?? focus.column];
           setDraft(raw === null || raw === undefined ? '' : String(raw));
           setEditing(focus);
@@ -719,7 +719,7 @@ export function DataGrid({
                         }
                       }}
                       onDoubleClick={() => {
-                        if (!editable || meta.column.binary || !rowKey) return;
+                        if (!editable || meta.column.binary || meta.column.readonly || !rowKey) return;
                         setDraft(raw === null || raw === undefined ? '' : String(raw));
                         setEditing({ row: index, column: columnIndex });
                       }}
@@ -733,7 +733,7 @@ export function DataGrid({
                           'ring-1 ring-inset ring-primary/70',
                         isPending && 'opacity-45',
                         queued && 'bg-warning/12',
-                        editable && !meta.column.binary && 'cursor-cell',
+                        editable && !meta.column.binary && !meta.column.readonly && 'cursor-cell',
                       )}
                     >
                       {isEditing ? (

@@ -51,7 +51,12 @@ function sendJson(res, status, payload) {
 
 function sendError(res, err) {
   const status = typeof err?.status === 'number' ? err.status : 500;
-  if (status >= 500) console.error('[db-lens]', err);
+  if (status >= 500) {
+    // 503 means the source is unreachable — an expected operational state, not
+    // an internal fault, so it gets one line instead of a stack trace.
+    if (status === 503) console.error(`[db-lens] 503: ${err?.message ?? err}`);
+    else console.error('[db-lens]', err);
+  }
   sendJson(res, status, {
     error: err?.message ?? 'Internal error',
     ...(err?.code ? { code: err.code } : {}),

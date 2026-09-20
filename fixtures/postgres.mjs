@@ -29,21 +29,28 @@ function docker(args, options = {}) {
   return execFileSync('docker', args, { encoding: 'utf8', ...options });
 }
 
-function isRunning() {
+/** `running` | `stopped` | `missing` — `docker rm -f` exits 0 either way. */
+function containerStatus() {
   try {
-    return docker(['inspect', '-f', '{{.State.Running}}', NAME]).trim() === 'true';
+    // Stderr is swallowed: a missing container is an answer, not an error to
+    // print above the message we are about to give.
+    return docker(['inspect', '-f', '{{.State.Running}}', NAME], {
+      stdio: ['ignore', 'pipe', 'ignore'],
+    }).trim() === 'true'
+      ? 'running'
+      : 'stopped';
   } catch {
-    return false;
+    return 'missing';
   }
 }
 
 function stop() {
-  try {
-    docker(['rm', '-f', NAME], { stdio: 'ignore' });
-    console.log(`removed ${NAME}`);
-  } catch {
-    console.log(`${NAME} was not running`);
+  if (containerStatus() === 'missing') {
+    console.log(`${NAME} is not running — nothing to remove`);
+    return;
   }
+  docker(['rm', '-f', NAME], { stdio: 'ignore' });
+  console.log(`removed ${NAME}`);
 }
 
 async function waitForReady(seconds = 60) {
@@ -76,7 +83,7 @@ async function main() {
     return;
   }
 
-  if (isRunning()) {
+  if (containerStatus() === 'running') {
     console.log(`reusing container ${NAME}`);
   } else {
     docker(['rm', '-f', NAME], { stdio: 'ignore' });

@@ -226,6 +226,7 @@ npm run smoke                # 228 API checks, starts its own server
 npm run smoke:ui             # 24 browser checks (needs npm run build first)
 npm run fixtures             # regenerate the sample files
 npm run fixtures:pg          # start a Docker Postgres and seed it
+npm run fixtures:pg -- stop  # remove it again
 ```
 
 Both suites are self-contained: they start a server on an ephemeral port with

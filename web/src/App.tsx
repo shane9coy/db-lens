@@ -9,7 +9,7 @@ import {
   Table2,
   Terminal,
 } from 'lucide-react';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   type Mutation,
   type RowPage,
@@ -87,6 +87,8 @@ export default function App() {
   const [focusToken, setFocusToken] = useState(0);
   const [refreshToken, setRefreshToken] = useState(0);
   const [objectsToken, setObjectsToken] = useState(0);
+  /** The grid's flush, so the row-detail delete can save buffered edits first. */
+  const gridFlush = useRef<(() => Promise<void>) | null>(null);
 
   const activeSource = useMemo(
     () => sources.find((source) => source.id === activeSourceId) ?? null,
@@ -508,6 +510,7 @@ export default function App() {
                 filter={filter}
                 offset={offset}
                 queryKey={queryKey}
+                flushHandle={gridFlush}
                 onSortChange={(column, dir) => {
                   setSort({ column, dir });
                   // Rows are addressed by ordering, so page N of a new ordering
@@ -604,6 +607,9 @@ export default function App() {
             const rowKey = page.rowKeys?.[detailRow];
             if (!rowKey) return;
             try {
+              // Deleting shifts every row below it, so buffered edits have to be
+              // written against the row numbers they were typed on.
+              await gridFlush.current?.();
               await mutate([{ op: 'delete', rowKey }]);
             } catch (err) {
               setError(err instanceof Error ? err.message : 'Delete failed');

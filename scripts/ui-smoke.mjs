@@ -51,6 +51,15 @@ function section(title) {
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+/** Edit mode is per source and persists, so turn it on only when it is off. */
+async function enableEdit(page) {
+  const toggle = page.locator('[role="switch"]').first();
+  if ((await toggle.getAttribute('aria-checked')) === 'false') {
+    await toggle.click();
+    await wait(1400);
+  }
+}
+
 /** Open a registered source and wait for the grid. */
 async function openSource(page, base, sourceId, object) {
   const hash = object ? `#/source/${sourceId}/${encodeURIComponent(object)}` : `#/source/${sourceId}`;
@@ -66,7 +75,7 @@ async function main() {
     return;
   }
 
-  for (const name of ['crm.sqlite', 'cities.csv']) {
+  for (const name of ['crm.sqlite', 'cities.csv', 'inventory.xlsx']) {
     fs.copyFileSync(path.join(FIXTURES, name), path.join(SCRATCH, name));
   }
 
@@ -75,7 +84,7 @@ async function main() {
   const base = `http://127.0.0.1:${port}`;
 
   const ids = {};
-  for (const name of ['crm.sqlite', 'cities.csv']) {
+  for (const name of ['crm.sqlite', 'cities.csv', 'inventory.xlsx']) {
     const res = await fetch(`${base}/api/sources`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
@@ -83,6 +92,14 @@ async function main() {
     });
     ids[name] = (await res.json()).added[0].id;
   }
+
+  /** One data row, straight from the API, to check what actually landed. */
+  const apiRow = async (sourceId, object, rowIndex = 0) => {
+    const page = await fetch(
+      `${base}/api/sources/${sourceId}/objects/${encodeURIComponent(object)}/rows?limit=${rowIndex + 1}`,
+    ).then((r) => r.json());
+    return page.rows[rowIndex];
+  };
 
   const browser = await chromium.launch();
   const page = await browser.newPage({ viewport: { width: 1440, height: 900 } });
@@ -195,8 +212,7 @@ async function main() {
     section('Editing');
 
     await openSource(page, base, ids['crm.sqlite'], 'settings');
-    await page.locator('[role="switch"]').first().click();
-    await wait(1300);
+    await enableEdit(page);
 
     await page.evaluate(() => {
       [...document.querySelectorAll('[role="row"]')][1]
@@ -230,8 +246,7 @@ async function main() {
     section('Spreadsheet writes');
 
     await openSource(page, base, ids['cities.csv']);
-    await page.locator('[role="switch"]').first().click();
-    await wait(1300);
+    await enableEdit(page);
     await page.locator('button:text-is("Row")').click();
     await wait(700);
 
@@ -288,6 +303,78 @@ async function main() {
       return rows.every((r, i) => r.querySelectorAll('[role="gridcell"]')[1].textContent === ['Alpha', 'Beta'][i]);
     }));
     check('with nothing left unsaved', (await page.locator('text=/unsaved/').count()) === 0);
+
+    // ------------------------------------------------- a batch stays put
+    section('A buffered edit cannot cross to another sheet');
+
+    await openSource(page, base, ids['inventory.xlsx'], 'Inventory');
+    await enableEdit(page);
+
+    const untouchedBefore = await apiRow(ids['inventory.xlsx'], 'Q2 Targets');
+    const inventoryBefore = await apiRow(ids['inventory.xlsx'], 'Inventory');
+
+    await page.evaluate(() => {
+      [...document.querySelectorAll('[role="row"]')][1]
+        .querySelectorAll('[role="gridcell"]')[1]
+        .dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
+    });
+    await page.locator('[role="grid"] input').fill('CROSSWRITE');
+    await page.keyboard.press('Enter');
+
+    // Switch sheets while the edit is still buffered. The batch must follow the
+    // sheet it was typed on, not the one being opened.
+    await page.locator('aside button').filter({ hasText: 'Q2 Targets' }).first().click();
+    await wait(3000);
+
+    const untouchedAfter = await apiRow(ids['inventory.xlsx'], 'Q2 Targets');
+    const inventoryAfter = await apiRow(ids['inventory.xlsx'], 'Inventory');
+    eq('the sheet that was opened is untouched', untouchedAfter, untouchedBefore);
+    check(
+      'and the edit landed on the sheet it was typed on',
+      inventoryAfter[1] === 'CROSSWRITE' && inventoryBefore[1] !== 'CROSSWRITE',
+      `before=${inventoryBefore[1]} after=${inventoryAfter[1]}`,
+    );
+
+    // ------------------------------------------- re-editing keeps the value
+    section('Re-opening a buffered cell keeps what was typed');
+
+    await openSource(page, base, ids['cities.csv']);
+    await enableEdit(page);
+
+    await page.evaluate(() => {
+      [...document.querySelectorAll('[role="row"]')][1]
+        .querySelectorAll('[role="gridcell"]')[1]
+        .dispatchEvent(new MouseEvent('dblclick', { bubbles: true }));
+    });
+    await page.locator('[role="grid"] input').fill('KEEPME');
+    await page.keyboard.press('Enter');
+    await wait(150);
+
+    // Focus the same cell without opening an editor (a plain mousedown), then
+    // Enter. The editor must be seeded from the buffered value, not the stale
+    // server one — committing the stale draft silently reverted the edit.
+    // The two events need a render between them, or the key handler still sees
+    // the focus from before the click.
+    await page.evaluate(() => {
+      const cell = [...document.querySelectorAll('[role="row"]')][1].querySelectorAll('[role="gridcell"]')[1];
+      cell.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+    });
+    await wait(250);
+    await page.evaluate(() => {
+      const grid = document.querySelector('[role="grid"]');
+      grid.focus();
+      grid.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+    });
+    await wait(300);
+
+    const seeded = await page.locator('[role="grid"] input').inputValue();
+    eq('the editor opens with the buffered value', seeded, 'KEEPME');
+
+    await page.keyboard.press('Enter');
+    await wait(2500);
+
+    const kept = await apiRow(ids['cities.csv'], 'Sheet1');
+    eq('and the typed value was not reverted', kept[1], 'KEEPME');
   } finally {
     await browser.close();
     await app.close();

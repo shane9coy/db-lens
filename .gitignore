@@ -8,7 +8,7 @@ data/
 
 # Artifacts written next to your data when editing a spreadsheet
 *.dblens-backup
-*.dblens-tmp
+*.dblens-tmp*
 
 .DS_Store
 *.log

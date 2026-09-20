@@ -48,7 +48,12 @@ export class SqliteAdapter {
     if (hit && now - hit.at < COUNT_TTL_MS) return hit.total;
 
     const total = compute();
-    if (this.#counts.size >= COUNT_CACHE_MAX) this.#counts.clear();
+    // Evict the oldest rather than clearing the map: a whole-map flush throws
+    // away the entry for the object being paged, and reclaiming it costs a full
+    // scan — orders of magnitude more than the entry it made room for.
+    if (this.#counts.size >= COUNT_CACHE_MAX) {
+      this.#counts.delete(this.#counts.keys().next().value);
+    }
     this.#counts.set(key, { total, at: now });
     return total;
   }
@@ -360,6 +365,10 @@ export class SqliteAdapter {
     const size = Math.max(1, Math.min(Math.floor(Number(limit)) || DEFAULT_LIMIT, MAX_LIMIT));
     const stmt = this.reader.prepare(sql);
     stmt.setReadBigInts(true);
+    // Positional rows: a projection with duplicate output names, which the
+    // console invites (`SELECT a.id, b.id`), would otherwise collapse to the
+    // last one and show a value from the wrong column.
+    stmt.setReturnArrays(true);
     const meta = stmt.columns();
 
     // Stream and stop at the cap. `stmt.all()` would materialise the entire
@@ -372,7 +381,7 @@ export class SqliteAdapter {
         truncated = true;
         break;
       }
-      rows.push(meta.map((m) => toJsonValue(record[m.name])));
+      rows.push(record.map((value) => toJsonValue(value)));
     }
 
     return {

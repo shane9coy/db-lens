@@ -14,6 +14,7 @@ import { Registry } from './registry.mjs';
 import { listDirectory, scanFolder } from './scan.mjs';
 import { assertSelectOnly } from './sqlguard.mjs';
 import { SourceManager } from './sources.mjs';
+import { SUPPORTED_EXTENSIONS } from './adapters/index.mjs';
 
 const ROOT = path.resolve(fileURLToPath(new URL('..', import.meta.url)));
 const DIST = path.join(ROOT, 'web', 'dist');
@@ -166,7 +167,8 @@ export function createServer({ dataDir, timeoutMs, localOnly = true } = {}) {
     name: 'db-lens',
     dataDir: resolvedData,
     uiBuilt: fs.existsSync(path.join(DIST, 'index.html')),
-    supported: ['.sqlite', '.db', '.xlsx', '.xls', '.csv'],
+    supported: SUPPORTED_EXTENSIONS,
+    connectionStrings: true,
   }));
 
   route('GET', '/api/fs/home', () => ({ home: process.env.HOME ?? process.cwd() }));

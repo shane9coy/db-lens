@@ -63,6 +63,17 @@ export function isBinaryType(declaredType) {
 
 const INTEGER_LITERAL = /^[+-]?\d+$/;
 const DECIMAL_LITERAL = /^[+-]?(\d+\.?\d*|\.\d+)([eE][+-]?\d+)?$/;
+/** Digits a double can carry before it starts rounding. */
+const EXACT_DIGITS = 15;
+
+/**
+ * Significant digits, ignoring sign, point, exponent and leading zeros — so
+ * `0.00012` counts as two and `1234567890123456.7` counts as seventeen.
+ */
+function significantDigits(text) {
+  const mantissa = text.split(/[eE]/)[0].replace(/^[+-]/, '').replace('.', '');
+  return mantissa.replace(/^0+/, '').length;
+}
 
 /**
  * Coerce a JSON value from the client into something the SQLite driver accepts.
@@ -89,14 +100,22 @@ export function coerceForAffinity(affinity, value) {
   }
   if (DECIMAL_LITERAL.test(trimmed)) {
     const numeric = Number(trimmed);
-    if (Number.isFinite(numeric)) return numeric;
+    if (!Number.isFinite(numeric)) return value;
+    // Hand anything a double cannot hold exactly to the database as text: a
+    // DECIMAL/NUMERIC column parses it without rounding, where `Number` would
+    // silently rewrite `12345678901234.56789` as `...56800` on save.
+    return significantDigits(trimmed) > EXACT_DIGITS ? value : numeric;
   }
   return value;
 }
 
 /**
- * A connection string may carry a password. Nothing that leaves the process —
- * an API response, a CLI banner, a log line — should contain it.
+ * A target may carry credentials. Nothing that leaves the process — an API
+ * response, a CLI banner, a log line — should contain them.
+ *
+ * Deliberately scheme-agnostic: today the only credential-bearing target is a
+ * Postgres connection string, but a future SSH or HTTP source would leak its
+ * password verbatim if this only recognised `postgres://`.
  *
  * Built by hand rather than through `URL`, whose serialiser percent-encodes
  * anything non-ASCII in the userinfo and would turn a mask into noise.
@@ -104,7 +123,7 @@ export function coerceForAffinity(affinity, value) {
 export function redactDsn(target) {
   const text = String(target ?? '');
   const schemeEnd = text.indexOf('://');
-  if (schemeEnd < 0 || !/^postgres(ql)?$/i.test(text.slice(0, schemeEnd))) return text;
+  if (schemeEnd <= 0 || !/^[a-z][a-z0-9+.-]*$/i.test(text.slice(0, schemeEnd))) return text;
 
   const userinfoStart = schemeEnd + 3;
   const at = text.lastIndexOf('@');

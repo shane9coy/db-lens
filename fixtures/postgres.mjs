@@ -85,7 +85,8 @@ async function main() {
       'run', '-d', '--name', NAME,
       '-e', `POSTGRES_PASSWORD=${PASSWORD}`,
       '-e', `POSTGRES_DB=${DATABASE}`,
-      '-p', `${PORT}:5432`,
+      // Loopback only: a fixture database has no business listening on the LAN.
+      '-p', `127.0.0.1:${PORT}:5432`,
       IMAGE,
     ], { stdio: 'ignore' });
   }

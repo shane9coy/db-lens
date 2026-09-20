@@ -172,7 +172,9 @@ retired, with a fresh one starting on the next call. Note the honest limit —
 terminating a thread parked inside native SQLite cannot interrupt the statement
 itself, so CPU it has already started is not reclaimed. The console is the only
 place you can ask for arbitrary work, and the row cap is enforced while
-streaming rather than after the fact.
+streaming rather than after the fact. On Postgres the statement is additionally
+embedded as a subquery, so "one statement" is a property of the dialect rather
+than only of the guard.
 
 The server answers only to loopback names (`localhost`, `127.0.0.1`, `::1`)
 unless you bind it elsewhere, which keeps a page on any other origin — and DNS
@@ -203,8 +205,8 @@ web/src/
   lib/api.ts                typed client for the API above
 fixtures/make.mjs           deterministic sample data for the files
 fixtures/postgres.mjs       starts a Docker Postgres and seeds it
-scripts/smoke.mjs           end-to-end API test (205 checks)
-scripts/ui-smoke.mjs        browser test for the grid (20 checks)
+scripts/smoke.mjs           end-to-end API test (228 checks)
+scripts/ui-smoke.mjs        browser test for the grid (24 checks)
 ```
 
 Every adapter implements the same calls — `probe`, `listObjects`, `getSchema`,
@@ -220,8 +222,8 @@ Table for the column model and TanStack Virtual for rows.
 ```bash
 npm start                    # backend on :4321, serving the built UI
 npm run dev                  # Vite dev server on :5173, proxying /api to :4321
-npm run smoke                # 205 API checks, starts its own server
-npm run smoke:ui             # 20 browser checks (needs npm run build first)
+npm run smoke                # 228 API checks, starts its own server
+npm run smoke:ui             # 24 browser checks (needs npm run build first)
 npm run fixtures             # regenerate the sample files
 npm run fixtures:pg          # start a Docker Postgres and seed it
 ```

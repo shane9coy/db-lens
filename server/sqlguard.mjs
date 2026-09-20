@@ -40,6 +40,11 @@ const FORBIDDEN = new RegExp(
       // server-side file access
       'pg_read_file', 'pg_read_binary_file', 'pg_ls_dir', 'lo_import', 'lo_export',
       'readfile', 'writefile', 'edit', 'fts3_tokenizer',
+      // functions that write even though they are called from a SELECT:
+      // sequences mutate, set_config changes the session, and the rest act on
+      // the server rather than on data.
+      'set_config', 'nextval', 'setval', 'pg_terminate_backend', 'pg_cancel_backend',
+      'pg_reload_conf', 'pg_rotate_logfile', 'pg_stat_reset', 'dblink',
     ].join('|') +
     String.raw`)\b`,
   'i',
@@ -48,6 +53,15 @@ const FORBIDDEN = new RegExp(
 /**
  * Replace comments, string literals and quoted identifiers with spaces so the
  * remaining text is pure SQL grammar.
+ *
+ * This has to understand every way the guarded dialect can spell a literal,
+ * because anything the masker blanks is invisible to the checks that follow
+ * while remaining live SQL on the server. Postgres dollar-quoting is the sharp
+ * case: `$$x'$$` is one opaque literal to Postgres, but a masker that knows only
+ * `'` reads the embedded quote as the start of a literal that never ends — so
+ * everything after it, including any stacked statements, disappears from the
+ * validated text. Escape strings (`E'...'`, `U&'...'`) matter for the same
+ * reason: there a backslash really does escape the closing quote.
  */
 export function maskSql(sql) {
   const src = String(sql);
@@ -59,6 +73,9 @@ export function maskSql(sql) {
       out[k] = src[k] === '\n' ? '\n' : ' ';
     }
   };
+
+  // $tag$ ... $tag$  (the tag is optional; `$$` is the empty tag)
+  const DOLLAR_TAG = /^\$([A-Za-z_\u0080-\uffff][A-Za-z0-9_\u0080-\uffff]*)?\$/;
 
   while (i < src.length) {
     const ch = src[i];
@@ -83,10 +100,30 @@ export function maskSql(sql) {
       continue;
     }
 
-    // 'string' / "identifier" / `identifier` — doubled quote is an escape
+    // dollar-quoted literal
+    if (ch === '$') {
+      const tag = DOLLAR_TAG.exec(src.slice(i));
+      if (tag) {
+        const end = src.indexOf(tag[0], i + tag[0].length);
+        const stop = end < 0 ? src.length : end + tag[0].length;
+        blank(i, stop);
+        i = stop;
+        continue;
+      }
+    }
+
+    // 'string' / E'string' / U&'string' / "identifier" / `identifier`
+    // A doubled quote is an escape; only the E/U& forms treat `\` as one.
     if (ch === "'" || ch === '"' || ch === '`') {
+      const escapeString =
+        ch === "'" && (/[Ee]$/.test(src.slice(0, i)) || /[Uu]&$/.test(src.slice(0, i)));
+
       let j = i + 1;
       while (j < src.length) {
+        if (escapeString && src[j] === '\\') {
+          j += 2;
+          continue;
+        }
         if (src[j] === ch) {
           if (src[j + 1] === ch) {
             j += 2;

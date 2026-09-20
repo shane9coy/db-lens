@@ -24,6 +24,13 @@ import { redactDsn } from './util.mjs';
 const MAX_FOLDER_IMPORTS = 300;
 /** How many files are validated at once during a folder import. */
 const IMPORT_CONCURRENCY = 8;
+/**
+ * An engine holds a worker thread and, for Postgres, a database connection. One
+ * per saved source is fine until there are hundreds of them, so an engine that
+ * has gone unused for a while is closed; the next request starts a fresh one.
+ */
+const ENGINE_IDLE_MS = 5 * 60 * 1000;
+const REAP_INTERVAL_MS = 60 * 1000;
 
 /** Readable label for a connection string, since it has no basename. */
 function connectionLabel(target) {
@@ -40,10 +47,25 @@ export class SourceManager {
   #registry;
   #engines = new Map();
   #timeoutMs;
+  #idleMs;
+  #reaper;
 
-  constructor({ registry, timeoutMs = DEFAULT_TIMEOUT_MS }) {
+  constructor({ registry, timeoutMs = DEFAULT_TIMEOUT_MS, idleMs = ENGINE_IDLE_MS }) {
     this.#registry = registry;
     this.#timeoutMs = timeoutMs;
+    this.#idleMs = idleMs;
+    this.#reaper = setInterval(() => void this.#reapIdle(), REAP_INTERVAL_MS);
+    // Reporting on engines must not be a reason for the process to stay up.
+    this.#reaper.unref?.();
+  }
+
+  async #reapIdle() {
+    const cutoff = Date.now() - this.#idleMs;
+    for (const [id, entry] of [...this.#engines]) {
+      if (entry.lastUsed > cutoff) continue;
+      this.#engines.delete(id);
+      await entry.engine.close().catch(() => {});
+    }
   }
 
   #signature(source) {
@@ -60,7 +82,10 @@ export class SourceManager {
     const signature = this.#signature(source);
     const existing = this.#engines.get(source.id);
     if (existing) {
-      if (existing.signature === signature) return existing.engine;
+      if (existing.signature === signature) {
+        existing.lastUsed = Date.now();
+        return existing.engine;
+      }
       existing.engine.close().catch(() => {});
       this.#engines.delete(source.id);
     }
@@ -70,7 +95,7 @@ export class SourceManager {
       kind: source.kind,
       timeoutMs: this.#timeoutMs,
     });
-    this.#engines.set(source.id, { engine, signature });
+    this.#engines.set(source.id, { engine, signature, lastUsed: Date.now() });
     return engine;
   }
 
@@ -82,6 +107,8 @@ export class SourceManager {
   }
 
   async closeAll() {
+    clearInterval(this.#reaper);
+    this.#reaper = null;
     const entries = [...this.#engines.values()];
     this.#engines.clear();
     await Promise.all(entries.map((e) => e.engine.close()));
@@ -190,6 +217,11 @@ export class SourceManager {
           added.slice(i, i + IMPORT_CONCURRENCY).map(async (source) => {
             try {
               await this.#engine(source).call('ping', {}, { timeoutMs: 15_000 });
+              // Validating a file is not selecting it. Holding an engine per
+              // imported file would keep a worker thread — and, for Postgres, a
+              // connection — per file for the process lifetime; the first click
+              // pays the (already paid) spawn cost instead.
+              await this.drop(source.id);
             } catch (err) {
               this.#registry.remove(source.id);
               await this.drop(source.id);

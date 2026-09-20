@@ -42,6 +42,7 @@ const NUMERIC_OID = 1700;
 const DATE_OID = 1082;
 const TIME_OID = 1083;
 const TIMESTAMP_OID = 1114;
+const TIMESTAMPTZ_OID = 1184;
 const TIMETZ_OID = 1266;
 const INTERVAL_OID = 1186;
 
@@ -69,13 +70,19 @@ function parseNumeric(text) {
 types.setTypeParser(INT8_OID, parseExactInteger);
 types.setTypeParser(NUMERIC_OID, parseNumeric);
 
-// A calendar date has no time and no zone. The default parser turns it into a
-// Date at local midnight, which renders as a zoned timestamp and can even land
-// on the wrong day; keep the stored text instead, as the SQLite adapter does.
-// An interval parses into a `{days, hours, …}` object that would render as raw
-// JSON, so it keeps its text too. `timestamptz` keeps the default (an absolute
-// instant), because there the offset carries meaning.
-for (const oid of [DATE_OID, TIME_OID, TIMESTAMP_OID, TIMETZ_OID, INTERVAL_OID]) {
+// Temporal values keep their stored text. The default parsers build JS Dates,
+// which are millisecond-precision: `timestamptz` loses microseconds on read and
+// a save-through then writes the truncated instant back. `date` additionally
+// becomes a zoned instant at local midnight, which can land on the wrong day,
+// and `interval` becomes a `{days, hours, …}` object that renders as raw JSON.
+for (const oid of [
+  DATE_OID,
+  TIME_OID,
+  TIMESTAMP_OID,
+  TIMESTAMPTZ_OID,
+  TIMETZ_OID,
+  INTERVAL_OID,
+]) {
   types.setTypeParser(oid, (text) => text);
 }
 
@@ -152,7 +159,12 @@ export class PostgresAdapter {
     if (hit && now - hit.at < COUNT_TTL_MS) return hit.total;
 
     const total = await compute();
-    if (this.#counts.size >= COUNT_CACHE_MAX) this.#counts.clear();
+    // Evict the oldest rather than clearing the map: a whole-map flush throws
+    // away the entry for the object being paged, and reclaiming it costs a full
+    // scan — orders of magnitude more than the entry it made room for.
+    if (this.#counts.size >= COUNT_CACHE_MAX) {
+      this.#counts.delete(this.#counts.keys().next().value);
+    }
     this.#counts.set(key, { total, at: now });
     return total;
   }
@@ -175,7 +187,12 @@ export class PostgresAdapter {
     if (!this.#readPool) {
       this.#readPool = new Pool({
         connectionString: this.path,
-        max: 4,
+        // One connection per source. The pool is per source and lives until the
+        // source is dropped, so anything larger multiplies by the number of
+        // saved databases — 25 sources at max 4 is 100 sockets, which is a
+        // stock server's entire max_connections, and the failure mode is that
+        // *every* client of that database is locked out.
+        max: 1,
         application_name: 'db-lens',
         // A host that silently drops packets would otherwise hang forever.
         connectionTimeoutMillis: 10_000,
@@ -193,7 +210,7 @@ export class PostgresAdapter {
     if (!this.#writePool) {
       this.#writePool = new Pool({
         connectionString: this.path,
-        max: 2,
+        max: 1,
         application_name: 'db-lens',
         connectionTimeoutMillis: 10_000,
         options: `-c statement_timeout=${this.#statementTimeout}`,
@@ -247,7 +264,13 @@ export class PostgresAdapter {
                 format_type(a.atttypid, a.atttypmod) AS type,
                 t.typname AS base_type,
                 NOT a.attnotnull AS nullable,
-                pg_get_expr(d.adbin, d.adrelid) AS default_value
+                a.attgenerated AS generated,
+                -- pg_get_expr returns the default *expression*. Only a constant
+                -- is a value a client can send back; publishing nextval(...) or
+                -- now() would have the New-row dialog pre-fill and submit it.
+                CASE WHEN a.attgenerated = '' AND left(d.adbin::text, 6) = '{CONST'
+                     THEN pg_get_expr(d.adbin, d.adrelid)
+                END AS default_value
            FROM pg_attribute a
            JOIN pg_type t ON t.oid = a.atttypid
            LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
@@ -255,10 +278,14 @@ export class PostgresAdapter {
           ORDER BY a.attnum`,
         [relation.oid],
       ),
+      // indkey holds the key columns followed by any INCLUDE columns, and
+      // indnkeyatts is how many of them are actually the key.
       this.#query(
         `SELECT a.attname AS name
            FROM pg_index i
-           JOIN pg_attribute a ON a.attrelid = i.indrelid AND a.attnum = ANY (i.indkey)
+           JOIN pg_attribute a
+             ON a.attrelid = i.indrelid
+            AND a.attnum = ANY (i.indkey[0:i.indnkeyatts - 1])
           WHERE i.indrelid = $1 AND i.indisprimary
           ORDER BY array_position(i.indkey::int2[], a.attnum)`,
         [relation.oid],
@@ -299,8 +326,9 @@ export class PostgresAdapter {
         binary: isBinaryType(row.base_type),
         // Postgres names an array type with a leading underscore. Arrays arrive
         // parsed, so the grid would render JSON while the server expects the
-        // `{a,b}` literal — readable, but not safely writable.
-        readonly: String(row.base_type ?? '').startsWith('_'),
+        // `{a,b}` literal — readable, but not safely writable. A generated
+        // column can never be assigned at all.
+        readonly: String(row.base_type ?? '').startsWith('_') || row.generated !== '',
         default: toJsonValue(row.default_value),
       })),
       indexes: indexes.rows.map((row) => ({
@@ -374,8 +402,12 @@ export class PostgresAdapter {
 
     let rowCount = null;
     try {
-      const { rows } = await this.#query(`SELECT count(*)::bigint AS n FROM ${described.ref}`);
-      rowCount = parseExactInteger(String(rows[0].n));
+      // Same key `getRows` uses for an unfiltered page, so opening a table and
+      // then reading it pays for one count rather than two.
+      rowCount = await this.#countOf(`${name}\u0000\u0000`, async () => {
+        const { rows } = await this.#query(`SELECT count(*)::bigint AS n FROM ${described.ref}`);
+        return parseExactInteger(String(rows[0].n));
+      });
     } catch {
       rowCount = null;
     }
@@ -490,8 +522,20 @@ export class PostgresAdapter {
     try {
       await client.query('BEGIN READ ONLY');
       try {
-        await client.query(`DECLARE dblens_cursor NO SCROLL CURSOR FOR ${sql}`);
-        const fetched = await client.query(`FETCH FORWARD ${size + 1} FROM dblens_cursor`);
+        // Embedding the statement as a subquery makes "one statement" a
+        // property of the dialect rather than something the guard has to get
+        // right: a `;` inside the parentheses is a syntax error, not a second
+        // command. The guard runs first and still reports the nicer message.
+        await client.query(
+          `DECLARE dblens_cursor NO SCROLL CURSOR FOR SELECT * FROM (${sql}) AS dblens_console`,
+        );
+        const fetched = await client.query({
+          text: `FETCH FORWARD ${size + 1} FROM dblens_cursor`,
+          // Positional rows: a projection with duplicate output names, which
+          // the console invites (`SELECT c.id, o.id`), would otherwise collapse
+          // to the last one and show a value from the wrong column.
+          rowMode: 'array',
+        });
         rows = fetched.rows;
         fields = fetched.fields;
         await client.query('CLOSE dblens_cursor');
@@ -520,7 +564,7 @@ export class PostgresAdapter {
         pk: false,
         binary: isBinaryType(baseTypes[i]),
       })),
-      rows: page.map((row) => fields.map((field) => toJsonValue(row[field.name]))),
+      rows: page.map((row) => row.map((value) => toJsonValue(value))),
       rowKeys: null,
       rowKeyKind: 'none',
       total: page.length,
@@ -589,7 +633,7 @@ export class PostgresAdapter {
           throw badRequest(`Column "${column.name}" holds binary data and cannot be edited here.`);
         }
         if (column.readonly) {
-          throw badRequest(`Column "${column.name}" is an array and cannot be edited here.`);
+          throw badRequest(`Column "${column.name}" is generated or an array and cannot be edited here.`);
         }
         return { kind: 'update', column, where: whereFor(op.rowKey, 1), value: op.value };
       }
@@ -600,7 +644,17 @@ export class PostgresAdapter {
         const entries = Object.entries(op.values ?? {});
         if (!entries.length) throw badRequest('Nothing to insert.');
         for (const [key] of entries) {
-          if (!byName.has(key)) throw badRequest(`Unknown column: ${key}`);
+          const column = byName.get(key);
+          if (!column) throw badRequest(`Unknown column: ${key}`);
+          // The same restrictions the update path applies. Without these the
+          // insert path would accept the base64 text the reader produced for a
+          // bytea column and store it as literal bytes.
+          if (column.binary) {
+            throw badRequest(`Column "${column.name}" holds binary data and cannot be edited here.`);
+          }
+          if (column.readonly) {
+            throw badRequest(`Column "${column.name}" cannot be written here.`);
+          }
         }
         return { kind: 'insert', entries };
       }

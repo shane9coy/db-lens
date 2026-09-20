@@ -16,6 +16,7 @@ import {
   X,
 } from 'lucide-react';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type { RefObject } from 'react';
 import type { Column, Mutation, RowPage, Schema, Source } from '@/lib/api';
 import { KIND_CLASS, formatCell, shortType, typeTone, valueKind } from '@/lib/format';
 import { cn } from '@/lib/utils';
@@ -100,6 +101,7 @@ export function DataGrid({
   filter,
   offset,
   queryKey,
+  flushHandle,
   onSortChange,
   onFilterChange,
   onMutate,
@@ -115,6 +117,11 @@ export function DataGrid({
   offset: number;
   /** Changes when the query changes — but not when a mutation just refetches. */
   queryKey: string;
+  /**
+   * Publishes the grid's flush so a caller outside the grid — the row-detail
+   * dialog's delete, which shifts rows — can save buffered edits first.
+   */
+  flushHandle: RefObject<(() => Promise<void>) | null>;
   onSortChange: (column: string | null, dir: 'asc' | 'desc') => void;
   onFilterChange: (q: string) => void;
   onMutate: (ops: Mutation[]) => Promise<void>;
@@ -138,6 +145,16 @@ export function DataGrid({
   const buffer = useRef(new Map<string, BufferedEdit>());
   const flushTimer = useRef<number | null>(null);
   const mutateRef = useRef(onMutate);
+  /**
+   * The mutate a buffered batch belongs to.
+   *
+   * `mutateRef` is refreshed in an effect, and the effect that flushes on a
+   * view change runs after it — so reading `mutateRef` at flush time would send
+   * the batch to the object just opened, with row numbers from the object just
+   * left. Pinning it on the first buffered edit of a batch keeps the two
+   * together; a view change always flushes, so a batch never spans two views.
+   */
+  const writerRef = useRef(onMutate);
   const flushRef = useRef<() => Promise<void>>(async () => {});
 
   useEffect(() => {
@@ -271,7 +288,7 @@ export function DataGrid({
     setInFlight(new Set(entries.map(([key]) => key)));
 
     try {
-      await mutateRef.current(
+      await writerRef.current(
         entries.map(([, edit]) => ({
           op: 'update' as const,
           rowKey: edit.rowKey,
@@ -289,7 +306,11 @@ export function DataGrid({
 
   useEffect(() => {
     flushRef.current = flush;
-  }, [flush]);
+    flushHandle.current = flush;
+    return () => {
+      flushHandle.current = null;
+    };
+  }, [flush, flushHandle]);
 
   /** Save anything outstanding when the tab is hidden or the grid goes away. */
   useEffect(() => {
@@ -350,6 +371,10 @@ export function DataGrid({
           });
         return;
       }
+
+      // The batch belongs to the view it was typed on, so capture its writer
+      // before the first edit joins it.
+      if (buffer.current.size === 0) writerRef.current = mutateRef.current;
 
       buffer.current.set(key, { rowKey, column, value: next });
       setBufferedCount(buffer.current.size);
@@ -429,7 +454,12 @@ export function DataGrid({
           event.preventDefault();
           const column = visible[focus.column]?.columnDef.meta?.column;
           if (!editable || !column || column.binary || column.readonly) return;
-          const raw = page.rows[focus.row]?.[column.colIndex ?? focus.column];
+          // Seed from what the cell is showing, which may be a buffered edit
+          // rather than the value the server still holds.
+          const queuedEdit = buffer.current.get(`${focus.row}:${focus.column}`);
+          const raw = queuedEdit
+            ? queuedEdit.value
+            : page.rows[focus.row]?.[column.colIndex ?? focus.column];
           setDraft(raw === null || raw === undefined ? '' : String(raw));
           setEditing(focus);
           break;
